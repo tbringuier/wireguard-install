@@ -141,6 +141,20 @@ assertEquals "peer blocks round-trip" "${PEERS}" "$(getPeerBlocksFromConfig "${T
 assertEquals "hooks extraction" $'PostUp = iptables -I INPUT -j ACCEPT\nPostDown = iptables -D INPUT -j ACCEPT' "$(getHooksFromConfig "${TMP_CONF}")"
 assertEquals "missing file gives nothing" "" "$(getPeerBlocksFromConfig /nonexistent)"
 
+# --- status view helpers ---
+NOW=1700000000
+assertEquals "age: never" never "$(formatAge 0 "${NOW}")"
+assertEquals "age: seconds" "5s ago" "$(formatAge $((NOW - 5)) "${NOW}")"
+assertEquals "age: minutes" "2min ago" "$(formatAge $((NOW - 125)) "${NOW}")"
+assertEquals "age: hours" "2h ago" "$(formatAge $((NOW - 7200)) "${NOW}")"
+assertEquals "age: days" "2d ago" "$(formatAge $((NOW - 200000)) "${NOW}")"
+assertEquals "bytes: zero" "0B" "$(formatBytes 0)"
+assertEquals "bytes: mebibytes" "1.2MiB" "$(formatBytes 1234567)"
+assertEquals "bytes: gibibytes" "5.0GiB" "$(formatBytes 5368709120)"
+assertEquals "clients listed from the config" \
+	$'alice|public|KEYA|203.0.113.5, 2001:db8::5|[2001:db8::1]:51820\nbob|private|KEYB|10.66.66.2, fd42:42:42::2|198.51.100.1:51820\ncarol|mixed|KEYC|203.0.113.6, 10.66.66.3|vpn.example.com:51820' \
+	"$(listClientsFromConfig "${TMP_CONF}")"
+
 # --- sysctl ---
 SYSCTL=$(buildSysctlConfig yes eth0)
 assertContains "forwarding" "net.ipv4.ip_forward = 1" "${SYSCTL}"

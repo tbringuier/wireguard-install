@@ -1322,15 +1322,94 @@ ${NEW_PEER_BLOCK}"
 	echo -e "${GREEN}Your client config file is in ${CLIENT_FILE}${NC}"
 }
 
-function listClients() {
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-	if [[ ${NUMBER_OF_CLIENTS} -eq 0 ]]; then
-		echo ""
-		echo "You have no existing clients!"
-		exit 1
+function formatAge() {
+	# formatAge <epoch seconds> [now]: elapsed time of a handshake, "never" for 0
+	local ELAPSED
+
+	if [[ $1 -eq 0 ]]; then
+		echo never
+		return
+	fi
+	ELAPSED=$((${2:-$(date +%s)} - $1))
+	if ((ELAPSED < 60)); then
+		echo "${ELAPSED}s ago"
+	elif ((ELAPSED < 3600)); then
+		echo "$((ELAPSED / 60))min ago"
+	elif ((ELAPSED < 86400)); then
+		echo "$((ELAPSED / 3600))h ago"
+	else
+		echo "$((ELAPSED / 86400))d ago"
+	fi
+}
+
+function formatBytes() {
+	LC_ALL=C numfmt --to=iec-i --suffix=B "$1"
+}
+
+function listClientsFromConfig() {
+	# listClientsFromConfig <config file>: "name|mode|public key|addresses|endpoint" per client
+	# Addresses are listed like in the client configuration: public first, IPv4 first
+	awk -F ': ' '
+		/^### Client / { name = $0; sub(/^### Client /, "", name); mode = ""; endpoint = ""; split("", address) }
+		/^# AddressMode: / { mode = $2 }
+		/^# PublicIPv4: / { address[1] = $2 }
+		/^# PrivateIPv4: / { address[2] = $2 }
+		/^# PublicIPv6: / { address[3] = $2 }
+		/^# PrivateIPv6: / { address[4] = $2 }
+		/^# Endpoint: / { endpoint = $2 }
+		/^PublicKey = / {
+			addresses = ""
+			for (i = 1; i <= 4; i++) if (address[i] != "") addresses = addresses (addresses != "" ? ", " : "") address[i]
+			print name "|" mode "|" substr($0, 13) "|" addresses "|" endpoint
+		}' "$1"
+}
+
+function showStatus() {
+	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local PEER_BLOCKS
+	local DUMP
+	local NAME MODE KEY ADDRESSES ENDPOINT PEER_LINE SEEN_FROM HANDSHAKE TRAFFIC
+	local FORMAT='%-15s %-8s %-42s %-26s %-24s %-11s %s\n'
+
+	PEER_BLOCKS=$(getPeerBlocksFromConfig "${WG_CONF_FILE}")
+
+	echo ""
+	echo "Server"
+	echo "  Interface       ${SERVER_WG_NIC} on ${SERVER_PUB_NIC}, UDP port ${SERVER_PORT}, MTU ${SERVER_WG_MTU}, $(systemctl is-active "wg-quick@${SERVER_WG_NIC}")"
+	echo "  Endpoints       IPv4 ${SERVER_PUB_IPV4:-none}, IPv6 ${SERVER_PUB_IPV6:-none}, hostname ${SERVER_HOSTNAME:-none}"
+	echo "  Public routing  ${PUBLIC_ROUTING_MODE}${SERVER_PUB_IPV6_PREFIX:+, IPv6 prefix ${SERVER_PUB_IPV6_PREFIX}}"
+	echo "  Firewall        $(detectHostFirewall) detected, rules managed by the installer: ${FIREWALL_INTEGRATION}"
+	if [[ ${PUBLIC_ROUTING_MODE} == yes ]]; then
+		echo "  Announcements   $(systemctl is-active "wg-public-ipv4-announce@${SERVER_WG_NIC}") for: $(listPublicAddresses PublicIPv4 "${PEER_BLOCKS}" | paste -sd ' ')"
+		echo "  Proxy entries   $({
+			ip -4 neigh show proxy
+			ip -6 neigh show proxy
+		} 2>/dev/null | awk '{ print $1 }' | paste -sd ' ')"
+	fi
+	echo ""
+
+	if [[ -z ${PEER_BLOCKS} ]]; then
+		echo "No clients yet."
+		return
 	fi
 
-	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+	# shellcheck disable=SC2059
+	printf "${FORMAT}" CLIENT MODE ADDRESSES "CONNECTS TO" "SEEN FROM" HANDSHAKE "RX / TX"
+	DUMP=$(wg show "${SERVER_WG_NIC}" dump 2>/dev/null | tail -n +2)
+	while IFS='|' read -r NAME MODE KEY ADDRESSES ENDPOINT; do
+		PEER_LINE=$(grep -F "${KEY}" <<<"${DUMP}" | head -1)
+		if [[ -n ${PEER_LINE} ]]; then
+			SEEN_FROM=$(cut -f 3 <<<"${PEER_LINE}")
+			HANDSHAKE=$(formatAge "$(cut -f 5 <<<"${PEER_LINE}")")
+			TRAFFIC="$(formatBytes "$(cut -f 6 <<<"${PEER_LINE}")") / $(formatBytes "$(cut -f 7 <<<"${PEER_LINE}")")"
+		else
+			SEEN_FROM="-"
+			HANDSHAKE="not loaded"
+			TRAFFIC="-"
+		fi
+		# shellcheck disable=SC2059
+		printf "${FORMAT}" "${NAME}" "${MODE}" "${ADDRESSES}" "${ENDPOINT}" "${SEEN_FROM}" "${HANDSHAKE}" "${TRAFFIC}"
+	done < <(listClientsFromConfig "${WG_CONF_FILE}")
 }
 
 function revokeClient() {
@@ -1459,9 +1538,9 @@ function manageMenu() {
 	echo "It looks like WireGuard is already installed."
 	echo ""
 	echo "What do you want to do?"
-	echo "   1) Add a new user"
-	echo "   2) List all users"
-	echo "   3) Revoke existing user"
+	echo "   1) Add a new client"
+	echo "   2) Show clients and status"
+	echo "   3) Revoke a client"
 	echo "   4) Uninstall WireGuard"
 	echo "   5) Exit"
 	until [[ ${MENU_OPTION} =~ ^[1-5]$ ]]; do
@@ -1472,7 +1551,7 @@ function manageMenu() {
 		newClient
 		;;
 	2)
-		listClients
+		showStatus
 		;;
 	3)
 		revokeClient
