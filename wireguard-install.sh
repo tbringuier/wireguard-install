@@ -149,6 +149,13 @@ net.ipv6.conf.${SERVER_PUB_NIC}.accept_ra = 2"
 	fi
 }
 
+function applySysctlConfig() {
+	# systemd-sysctl ships with systemd-udev on Enterprise Linux, which minimal images may lack
+	if ! systemctl restart systemd-sysctl.service 2>/dev/null; then
+		sysctl -q -p /etc/sysctl.d/wg.conf
+	fi
+}
+
 function buildManagedRuleBlock() {
 	local SERVER_PORT=$1
 	local SERVER_PUB_NIC=$2
@@ -920,7 +927,9 @@ function installWireGuard() {
 			# qrencode lives in EPEL on Enterprise Linux
 			installOptionalPackages dnf install -y epel-release
 		fi
-		installPackages dnf install -y wireguard-tools iptables
+		installPackages dnf install -y wireguard-tools
+		# Prefer the nftables-backed iptables; EL8 only has the (nft-backed) iptables package
+		dnf install -y iptables-nft >/dev/null 2>&1 || installPackages dnf install -y iptables
 		installOptionalPackages dnf install -y qrencode
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
 			installOptionalPackages dnf install -y python3
@@ -929,7 +938,7 @@ function installWireGuard() {
 	arch)
 		installPackages pacman -S --needed --noconfirm wireguard-tools
 		if ! command -v iptables &>/dev/null; then
-			installPackages pacman -S --needed --noconfirm iptables
+			installPackages pacman -S --needed --noconfirm iptables-nft
 		fi
 		installOptionalPackages pacman -S --needed --noconfirm qrencode
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
@@ -938,6 +947,8 @@ function installWireGuard() {
 		;;
 	suse)
 		installPackages zypper --non-interactive install wireguard-tools iptables
+		# Metapackage switching the iptables alternatives to the nftables backend
+		installOptionalPackages zypper --non-interactive install iptables-backend-nft
 		installOptionalPackages zypper --non-interactive install qrencode
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
 			installOptionalPackages zypper --non-interactive install python3
@@ -984,8 +995,9 @@ FIREWALL_BACKEND=${FIREWALL_BACKEND}" >/etc/wireguard/params
 	writeServerConfig "/etc/wireguard/${SERVER_WG_NIC}.conf" "" "" ""
 
 	# Enable routing on the server
+	install -d /etc/sysctl.d
 	printf '%s\n' "$(buildSysctlConfig "${PUBLIC_ROUTING_MODE}" "${SERVER_PUB_NIC}")" >/etc/sysctl.d/wg.conf
-	systemctl restart systemd-sysctl.service
+	applySysctlConfig
 
 	systemctl enable --now "wg-quick@${SERVER_WG_NIC}"
 
@@ -1278,8 +1290,7 @@ function uninstallWg() {
 		rm -rf /etc/wireguard
 		rm -f /etc/sysctl.d/wg.conf
 
-		# systemd-sysctl cannot unset a value, so the ones enabled for routing are reset by hand
-		systemctl restart systemd-sysctl.service
+		# Removing the file does not unset anything, so the routing-only value is reset by hand
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
 			sysctl -q -w net.ipv6.conf.all.proxy_ndp=0
 		fi
