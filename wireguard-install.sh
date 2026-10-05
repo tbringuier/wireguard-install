@@ -1,7 +1,10 @@
 #!/bin/bash
 
-# Secure WireGuard server installer
-# https://github.com/angristan/wireguard-install
+# WireGuard server installer with public IP routing
+# https://github.com/tbringuier/wireguard-install
+#
+# Fork of https://github.com/angristan/wireguard-install (MIT licence).
+# Requires systemd. Tested on Debian, Ubuntu, Fedora, Rocky/Alma, Arch, openSUSE and Flatcar.
 
 RED='\033[0;31m'
 ORANGE='\033[0;33m'
@@ -20,8 +23,7 @@ function buildClientAddressLine() {
 		"${PUBLIC_IPV4:+${PUBLIC_IPV4}/32}" \
 		"${PRIVATE_IPV4:+${PRIVATE_IPV4}/32}" \
 		"${PUBLIC_IPV6:+${PUBLIC_IPV6}/128}" \
-		"${PRIVATE_IPV6:+${PRIVATE_IPV6}/128}"
-	do
+		"${PRIVATE_IPV6:+${PRIVATE_IPV6}/128}"; do
 		if [[ -z ${ADDRESS} ]]; then
 			continue
 		elif [[ -z ${ADDRESSES} ]]; then
@@ -43,13 +45,13 @@ function validateClientAddressMode() {
 
 	case "${CLIENT_ADDRESS_MODE}" in
 	private)
-		[[ ( -n ${PRIVATE_IPV4} || -n ${PRIVATE_IPV6} ) && -z ${PUBLIC_IPV4} && -z ${PUBLIC_IPV6} ]]
+		[[ (-n ${PRIVATE_IPV4} || -n ${PRIVATE_IPV6}) && -z ${PUBLIC_IPV4} && -z ${PUBLIC_IPV6} ]]
 		;;
 	public)
-		[[ ( -n ${PUBLIC_IPV4} || -n ${PUBLIC_IPV6} ) && -z ${PRIVATE_IPV4} && -z ${PRIVATE_IPV6} ]]
+		[[ (-n ${PUBLIC_IPV4} || -n ${PUBLIC_IPV6}) && -z ${PRIVATE_IPV4} && -z ${PRIVATE_IPV6} ]]
 		;;
 	mixed)
-		[[ ( -n ${PRIVATE_IPV4} || -n ${PRIVATE_IPV6} ) && ( -n ${PUBLIC_IPV4} || -n ${PUBLIC_IPV6} ) ]]
+		[[ (-n ${PRIVATE_IPV4} || -n ${PRIVATE_IPV6}) && (-n ${PUBLIC_IPV4} || -n ${PUBLIC_IPV6}) ]]
 		;;
 	*)
 		return 1
@@ -161,7 +163,7 @@ PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PUBLI
 PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV4}/32 -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PUBLIC_IPV4}/32 -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV4}/32 -j ACCEPT"
-	done <<< "${PUBLIC_IPV4_LIST}"
+	done <<<"${PUBLIC_IPV4_LIST}"
 
 	while IFS= read -r PUBLIC_IPV6; do
 		[[ -n ${PUBLIC_IPV6} ]] || continue
@@ -170,7 +172,7 @@ PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PUBL
 PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV6}/128 -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PUBLIC_IPV6}/128 -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV6}/128 -j ACCEPT"
-	done <<< "${PUBLIC_IPV6_LIST}"
+	done <<<"${PUBLIC_IPV6_LIST}"
 
 	echo "${RULES}"
 }
@@ -379,18 +381,6 @@ RestartSec=1
 WantedBy=multi-user.target'
 }
 
-function buildArpingOpenrcService() {
-	echo '#!/sbin/openrc-run
-description="WireGuard public IPv4 announcement loop"
-command="/etc/wireguard/wg-public-ipv4-arping.sh"
-command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
-
-depend() {
-	after net
-}'
-}
-
 function refreshPublicIpv4AnnouncementService() {
 	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
 
@@ -402,17 +392,10 @@ function refreshPublicIpv4AnnouncementService() {
 	printf '%s\n' "$(buildArpingLoopScript)" >/etc/wireguard/wg-public-ipv4-arping.sh
 	chmod +x /etc/wireguard/wg-public-ipv4-arping.sh
 
-	if [[ ${OS} == 'alpine' ]]; then
-		printf '%s\n' "$(buildArpingOpenrcService)" >/etc/init.d/wg-public-ipv4-arping
-		chmod +x /etc/init.d/wg-public-ipv4-arping
-		rc-update add wg-public-ipv4-arping >/dev/null 2>&1 || true
-		rc-service wg-public-ipv4-arping restart >/dev/null 2>&1 || rc-service wg-public-ipv4-arping start >/dev/null 2>&1
-	else
-		printf '%s\n' "$(buildArpingSystemdService)" >/etc/systemd/system/wg-public-ipv4-arping.service
-		systemctl daemon-reload
-		systemctl enable wg-public-ipv4-arping >/dev/null 2>&1
-		systemctl restart wg-public-ipv4-arping >/dev/null 2>&1 || systemctl start wg-public-ipv4-arping >/dev/null 2>&1
-	fi
+	printf '%s\n' "$(buildArpingSystemdService)" >/etc/systemd/system/wg-public-ipv4-arping.service
+	systemctl daemon-reload
+	systemctl enable wg-public-ipv4-arping >/dev/null 2>&1
+	systemctl restart wg-public-ipv4-arping >/dev/null 2>&1 || systemctl start wg-public-ipv4-arping >/dev/null 2>&1
 }
 
 function removePublicIpv4AnnouncementService() {
@@ -420,16 +403,10 @@ function removePublicIpv4AnnouncementService() {
 		return
 	fi
 
-	if [[ ${OS} == 'alpine' ]]; then
-		rc-service wg-public-ipv4-arping stop >/dev/null 2>&1 || true
-		rc-update del wg-public-ipv4-arping >/dev/null 2>&1 || true
-		rm -f /etc/init.d/wg-public-ipv4-arping
-	else
-		systemctl stop wg-public-ipv4-arping >/dev/null 2>&1 || true
-		systemctl disable wg-public-ipv4-arping >/dev/null 2>&1 || true
-		rm -f /etc/systemd/system/wg-public-ipv4-arping.service
-		systemctl daemon-reload
-	fi
+	systemctl stop wg-public-ipv4-arping >/dev/null 2>&1 || true
+	systemctl disable wg-public-ipv4-arping >/dev/null 2>&1 || true
+	rm -f /etc/systemd/system/wg-public-ipv4-arping.service
+	systemctl daemon-reload
 
 	rm -f /etc/wireguard/wg-public-ipv4-arping.sh
 	rm -f /etc/wireguard/public-ipv4.list
@@ -437,11 +414,7 @@ function removePublicIpv4AnnouncementService() {
 
 function applyWireGuardConfig() {
 	if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-		if [[ ${OS} == 'alpine' ]]; then
-			rc-service "wg-quick.${SERVER_WG_NIC}" restart
-		else
-			systemctl restart "wg-quick@${SERVER_WG_NIC}"
-		fi
+		systemctl restart "wg-quick@${SERVER_WG_NIC}"
 	else
 		wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
 	fi
@@ -455,6 +428,12 @@ function installPackages() {
 	fi
 }
 
+function installOptionalPackages() {
+	if ! "$@"; then
+		echo -e "${ORANGE}Optional packages could not be installed, continuing without them.${NC}"
+	fi
+}
+
 function isRoot() {
 	if [ "${EUID}" -ne 0 ]; then
 		echo "You need to run this script as root"
@@ -462,12 +441,29 @@ function isRoot() {
 	fi
 }
 
-function checkVirt() {
-	if command -v virt-what &>/dev/null; then
-		VIRT=$(virt-what)
-	else
-		VIRT=$(systemd-detect-virt)
+function checkSystemd() {
+	if [[ ! -d /run/systemd/system ]] || ! command -v systemctl &>/dev/null; then
+		echo "This script requires systemd as the init system."
+		exit 1
 	fi
+}
+
+function waitForCloudInit() {
+	# On a freshly provisioned cloud instance, cloud-init may still be configuring
+	# the network or running package updates. Wait for it before touching anything.
+	if command -v cloud-init &>/dev/null && [[ -d /run/cloud-init ]]; then
+		if ! cloud-init status >/dev/null 2>&1; then
+			return
+		fi
+		if [[ $(cloud-init status 2>/dev/null) == *running* ]]; then
+			echo "Waiting for cloud-init to finish..."
+			cloud-init status --wait >/dev/null 2>&1 || true
+		fi
+	fi
+}
+
+function checkVirt() {
+	VIRT=$(systemd-detect-virt)
 	if [[ ${VIRT} == "openvz" ]]; then
 		echo "OpenVZ is not supported"
 		exit 1
@@ -483,47 +479,86 @@ function checkVirt() {
 }
 
 function checkOS() {
+	if [[ ! -e /etc/os-release ]]; then
+		echo "Unable to detect the distribution: /etc/os-release is missing."
+		exit 1
+	fi
 	source /etc/os-release
 	OS="${ID}"
-	if [[ ${OS} == "debian" || ${OS} == "raspbian" ]]; then
-		if [[ ${VERSION_ID} -lt 10 ]]; then
-			echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 10 Buster or later"
+	OS_FAMILY=""
+
+	# Map the distribution (or the ones it derives from) to a package family
+	local CANDIDATE
+	for CANDIDATE in ${ID} ${ID_LIKE:-}; do
+		case "${CANDIDATE}" in
+		debian | ubuntu | raspbian)
+			OS_FAMILY=debian
+			;;
+		fedora | rhel | centos | almalinux | rocky | ol)
+			OS_FAMILY=rhel
+			;;
+		arch | archarm | manjaro)
+			OS_FAMILY=arch
+			;;
+		suse | opensuse | opensuse-leap | opensuse-tumbleweed | sles)
+			OS_FAMILY=suse
+			;;
+		flatcar)
+			OS_FAMILY=flatcar
+			;;
+		*)
+			continue
+			;;
+		esac
+		break
+	done
+
+	# Unknown distribution: fall back on the package manager that is available
+	if [[ -z ${OS_FAMILY} ]]; then
+		if command -v apt-get &>/dev/null; then
+			OS_FAMILY=debian
+		elif command -v dnf &>/dev/null; then
+			OS_FAMILY=rhel
+		elif command -v pacman &>/dev/null; then
+			OS_FAMILY=arch
+		elif command -v zypper &>/dev/null; then
+			OS_FAMILY=suse
+		else
+			echo "Looks like you aren't running this installer on a supported system (${PRETTY_NAME:-${ID}})."
+			echo "Supported package managers: apt-get, dnf, pacman, zypper. Flatcar Linux is supported as-is."
 			exit 1
 		fi
-		OS=debian # overwrite if raspbian
-	elif [[ ${OS} == "ubuntu" ]]; then
-		RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
-		if [[ ${RELEASE_YEAR} -lt 18 ]]; then
-			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 18.04 or later"
-			exit 1
-		fi
-	elif [[ ${OS} == "fedora" ]]; then
-		if [[ ${VERSION_ID} -lt 32 ]]; then
-			echo "Your version of Fedora (${VERSION_ID}) is not supported. Please use Fedora 32 or later"
-			exit 1
-		fi
-	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-		if [[ ${VERSION_ID} == 7* ]]; then
-			echo "Your version of CentOS (${VERSION_ID}) is not supported. Please use CentOS 8 or later"
-			exit 1
-		fi
-	elif [[ -e /etc/oracle-release ]]; then
-		source /etc/os-release
-		OS=oracle
-	elif [[ -e /etc/arch-release ]]; then
-		OS=arch
-	elif [[ -e /etc/alpine-release ]]; then
-		OS=alpine
-		if ! command -v virt-what &>/dev/null; then
-			if ! (apk update && apk add virt-what); then
-				echo -e "${RED}Failed to install virt-what. Continuing without virtualization check.${NC}"
+	fi
+
+	# Reject releases whose kernel or repositories predate WireGuard
+	local MAJOR_VERSION="${VERSION_ID%%.*}"
+	if [[ -n ${MAJOR_VERSION} && ${MAJOR_VERSION} =~ ^[0-9]+$ ]]; then
+		case "${OS}" in
+		debian | raspbian)
+			if [[ ${MAJOR_VERSION} -lt 11 ]]; then
+				echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 11 Bullseye or later"
+				exit 1
 			fi
-		fi
-	elif [[ ${OS} == "flatcar" ]] || [[ ${OS} == "coreos" && -n "${FLATCAR_BOARD:-}" ]]; then
-		OS=flatcar
-	else
-		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Fedora, CentOS, AlmaLinux, Rocky, Oracle, Arch, Alpine or Flatcar Linux system"
-		exit 1
+			;;
+		ubuntu)
+			if [[ ${MAJOR_VERSION} -lt 20 ]]; then
+				echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 20.04 or later"
+				exit 1
+			fi
+			;;
+		fedora)
+			if [[ ${MAJOR_VERSION} -lt 32 ]]; then
+				echo "Your version of Fedora (${VERSION_ID}) is not supported. Please use Fedora 32 or later"
+				exit 1
+			fi
+			;;
+		centos | almalinux | rocky | rhel | ol)
+			if [[ ${MAJOR_VERSION} -lt 8 ]]; then
+				echo "Your version of ${PRETTY_NAME:-${ID}} is not supported. Please use release 8 or later"
+				exit 1
+			fi
+			;;
+		esac
 	fi
 }
 
@@ -557,13 +592,15 @@ function getHomeDirForClient() {
 
 function initialCheck() {
 	isRoot
+	checkSystemd
 	checkOS
 	checkVirt
+	waitForCloudInit
 }
 
 function installQuestions() {
 	echo "Welcome to the WireGuard installer!"
-	echo "The git repository is available at: https://github.com/angristan/wireguard-install"
+	echo "The git repository is available at: https://github.com/tbringuier/wireguard-install"
 	echo ""
 	echo "I need to ask you a few questions before starting the setup."
 	echo "You can keep the default options and just press enter if you are ok with them."
@@ -616,13 +653,13 @@ function installQuestions() {
 		read -rp "Enable public IP routing support [yes/no]: " -e -i no PUBLIC_ROUTING_MODE
 	done
 
-	if pgrep firewalld >/dev/null; then
-		validatePublicRoutingEnvironment "${PUBLIC_ROUTING_MODE}" "yes" || exit 1
-		FIREWALL_BACKEND=$(selectFirewallBackend "${PUBLIC_ROUTING_MODE}" "yes")
+	if systemctl is-active --quiet firewalld; then
+		FIREWALLD_ACTIVE=yes
 	else
-		validatePublicRoutingEnvironment "${PUBLIC_ROUTING_MODE}" "no" || exit 1
-		FIREWALL_BACKEND=$(selectFirewallBackend "${PUBLIC_ROUTING_MODE}" "no")
+		FIREWALLD_ACTIVE=no
 	fi
+	validatePublicRoutingEnvironment "${PUBLIC_ROUTING_MODE}" "${FIREWALLD_ACTIVE}" || exit 1
+	FIREWALL_BACKEND=$(selectFirewallBackend "${PUBLIC_ROUTING_MODE}" "${FIREWALLD_ACTIVE}")
 
 	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
 		echo -e "\nWireGuard uses a parameter called AllowedIPs to determine what is routed over the VPN."
@@ -643,67 +680,60 @@ function installWireGuard() {
 	installQuestions
 
 	# Install WireGuard tools and module
-	if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' && ${VERSION_ID} -gt 10 ]]; then
-		apt-get update
-		installPackages apt-get install -y wireguard iptables resolvconf qrencode
+	case "${OS_FAMILY}" in
+	debian)
+		export DEBIAN_FRONTEND=noninteractive
+		# Wait for the dpkg lock: cloud-init or unattended-upgrades may hold it after boot
+		local APT_GET=(apt-get -o DPkg::Lock::Timeout=300)
+		"${APT_GET[@]}" update
+		installPackages "${APT_GET[@]}" install -y wireguard iptables
+		installOptionalPackages "${APT_GET[@]}" install -y qrencode
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installPackages apt-get install -y iputils-arping
+			installPackages "${APT_GET[@]}" install -y iputils-arping
 		fi
-	elif [[ ${OS} == 'debian' ]]; then
-		if ! grep -rqs "^deb .* buster-backports" /etc/apt/; then
-			echo "deb http://deb.debian.org/debian buster-backports main" >/etc/apt/sources.list.d/backports.list
-			apt-get update
+		;;
+	rhel)
+		if [[ ${OS} == 'ol' && ${VERSION_ID%%.*} == 8 ]]; then
+			# Oracle Linux 8 ships wireguard-tools in the UEK R6 developer repository
+			installPackages dnf install -y oraclelinux-developer-release-el8
+			dnf config-manager --disable -y ol8_developer
+			dnf config-manager --enable -y ol8_developer_UEKR6
+			dnf config-manager --save -y --setopt=ol8_developer_UEKR6.includepkgs='wireguard-tools*'
+		elif [[ ${OS} != 'fedora' && ${VERSION_ID%%.*} == 8 ]]; then
+			# The EL8 kernel predates WireGuard: use the ELRepo kernel module
+			installOptionalPackages dnf install -y epel-release elrepo-release
+			installPackages dnf install -y kmod-wireguard
+		elif [[ ${OS} != 'fedora' ]]; then
+			# qrencode lives in EPEL on Enterprise Linux
+			installOptionalPackages dnf install -y epel-release
 		fi
-		apt-get update
-		installPackages apt-get install -y iptables resolvconf qrencode
-		installPackages apt-get install -y -t buster-backports wireguard
-		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installPackages apt-get install -y iputils-arping
-		fi
-	elif [[ ${OS} == 'fedora' ]]; then
-		if [[ ${VERSION_ID} -lt 32 ]]; then
-			installPackages dnf install -y dnf-plugins-core
-			dnf copr enable -y jdoss/wireguard
-			installPackages dnf install -y wireguard-dkms
-		fi
-		installPackages dnf install -y wireguard-tools iptables qrencode
-		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installPackages dnf install -y iputils
-		fi
-	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-		if [[ ${VERSION_ID} == 8* ]]; then
-			installPackages yum install -y epel-release elrepo-release
-			installPackages yum install -y kmod-wireguard
-			yum install -y qrencode || true # not available on release 9
-		fi
-		installPackages yum install -y wireguard-tools iptables
-		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installPackages yum install -y iputils
-		fi
-	elif [[ ${OS} == 'oracle' ]]; then
-		installPackages dnf install -y oraclelinux-developer-release-el8
-		dnf config-manager --disable -y ol8_developer
-		dnf config-manager --enable -y ol8_developer_UEKR6
-		dnf config-manager --save -y --setopt=ol8_developer_UEKR6.includepkgs='wireguard-tools*'
-		installPackages dnf install -y wireguard-tools qrencode iptables
+		installPackages dnf install -y wireguard-tools iptables
+		installOptionalPackages dnf install -y qrencode
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
 			installPackages dnf install -y iputils
 		fi
-	elif [[ ${OS} == 'arch' ]]; then
-		installPackages pacman -S --needed --noconfirm wireguard-tools qrencode
+		;;
+	arch)
+		installPackages pacman -S --needed --noconfirm wireguard-tools
+		if ! command -v iptables &>/dev/null; then
+			installPackages pacman -S --needed --noconfirm iptables
+		fi
+		installOptionalPackages pacman -S --needed --noconfirm qrencode
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
 			installPackages pacman -S --needed --noconfirm iputils
 		fi
-	elif [[ ${OS} == 'flatcar' ]]; then
-		# Flatcar provides the required WireGuard tooling natively
-		:
-	elif [[ ${OS} == 'alpine' ]]; then
-		apk update
-		installPackages apk add wireguard-tools iptables libqrencode-tools
+		;;
+	suse)
+		installPackages zypper --non-interactive install wireguard-tools iptables
+		installOptionalPackages zypper --non-interactive install qrencode
 		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installPackages apk add arping
+			installPackages zypper --non-interactive install iputils
 		fi
-	fi
+		;;
+	flatcar)
+		# Flatcar ships WireGuard, iptables and iputils in its read-only /usr
+		;;
+	esac
 
 	# Verify WireGuard installation
 	if ! command -v wg &>/dev/null; then
@@ -718,10 +748,8 @@ function installWireGuard() {
 		validatePublicRoutingDependencies "${PUBLIC_ROUTING_MODE}" "no" || exit 1
 	fi
 
-	# Make sure the directory exists (this does not seem the be the case on fedora)
-	mkdir /etc/wireguard >/dev/null 2>&1
-
-	chmod 600 -R /etc/wireguard/
+	# Make sure the directory exists with restrictive permissions
+	install -d -m 700 /etc/wireguard
 
 	SERVER_PRIV_KEY=$(wg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
@@ -740,30 +768,16 @@ CLIENT_DNS_2=${CLIENT_DNS_2}
 ALLOWED_IPS=${ALLOWED_IPS}
 PUBLIC_ROUTING_MODE=${PUBLIC_ROUTING_MODE}
 FIREWALL_BACKEND=${FIREWALL_BACKEND}" >/etc/wireguard/params
+	chmod 600 /etc/wireguard/params
 
 	# Add server interface
 	writeServerConfig "/etc/wireguard/${SERVER_WG_NIC}.conf" "" "" ""
 
 	# Enable routing on the server
 	printf '%s\n' "$(buildSysctlConfig "${PUBLIC_ROUTING_MODE}")" >/etc/sysctl.d/wg.conf
+	sysctl --system >/dev/null
 
-	if [[ ${OS} == 'fedora' ]]; then
-		chmod -v 700 /etc/wireguard
-		chmod -v 600 /etc/wireguard/*
-	fi
-
-	if [[ ${OS} == 'alpine' ]]; then
-		sysctl -p /etc/sysctl.d/wg.conf
-		rc-update add sysctl
-		ln -s /etc/init.d/wg-quick "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
-		rc-service "wg-quick.${SERVER_WG_NIC}" start
-		rc-update add "wg-quick.${SERVER_WG_NIC}"
-	else
-		sysctl --system
-
-		systemctl start "wg-quick@${SERVER_WG_NIC}"
-		systemctl enable "wg-quick@${SERVER_WG_NIC}"
-	fi
+	systemctl enable --now "wg-quick@${SERVER_WG_NIC}"
 
 	refreshPublicIpv4AnnouncementService
 
@@ -771,29 +785,17 @@ FIREWALL_BACKEND=${FIREWALL_BACKEND}" >/etc/wireguard/params
 	echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
 
 	# Check if WireGuard is running
-	if [[ ${OS} == 'alpine' ]]; then
-		rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status
-	else
-		systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
-	fi
+	systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
 	WG_RUNNING=$?
 
 	# WireGuard might not work if we updated the kernel. Tell the user to reboot
 	if [[ ${WG_RUNNING} -ne 0 ]]; then
 		echo -e "\n${RED}WARNING: WireGuard does not seem to be running.${NC}"
-		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${ORANGE}You can check if WireGuard is running with: rc-service wg-quick.${SERVER_WG_NIC} status${NC}"
-		else
-			echo -e "${ORANGE}You can check if WireGuard is running with: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
-		fi
+		echo -e "${ORANGE}You can check if WireGuard is running with: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
 		echo -e "${ORANGE}If you get something like \"Cannot find device ${SERVER_WG_NIC}\", please reboot!${NC}"
 	else # WireGuard is running
 		echo -e "\n${GREEN}WireGuard is running.${NC}"
-		if [[ ${OS} == 'alpine' ]]; then
-			echo -e "${GREEN}You can check the status of WireGuard with: rc-service wg-quick.${SERVER_WG_NIC} status\n\n${NC}"
-		else
-			echo -e "${GREEN}You can check the status of WireGuard with: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
-		fi
+		echo -e "${GREEN}You can check the status of WireGuard with: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
 		echo -e "${ORANGE}If you don't have internet connectivity from your client, try to reboot the server.${NC}"
 	fi
 }
@@ -920,8 +922,7 @@ function newClient() {
 		"${CLIENT_PRIVATE_IPV4}" \
 		"${CLIENT_PUBLIC_IPV4}" \
 		"${CLIENT_PRIVATE_IPV6}" \
-		"${CLIENT_PUBLIC_IPV6}"
-	then
+		"${CLIENT_PUBLIC_IPV6}"; then
 		echo "The selected client address mode does not match the provided addresses."
 		exit 1
 	fi
@@ -1047,57 +1048,44 @@ function uninstallWg() {
 	read -rp "Do you really want to remove WireGuard? [y/n]: " -e REMOVE
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == 'y' ]]; then
-		checkOS
 		removePublicIpv4AnnouncementService
 
-		if [[ ${OS} == 'alpine' ]]; then
-			rc-service "wg-quick.${SERVER_WG_NIC}" stop
-			rc-update del "wg-quick.${SERVER_WG_NIC}"
-			unlink "/etc/init.d/wg-quick.${SERVER_WG_NIC}"
-			rc-update del sysctl
-		else
-			systemctl stop "wg-quick@${SERVER_WG_NIC}"
-			systemctl disable "wg-quick@${SERVER_WG_NIC}"
-		fi
+		systemctl disable --now "wg-quick@${SERVER_WG_NIC}"
 
-		if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
-			apt-get remove -y wireguard wireguard-tools qrencode
-		elif [[ ${OS} == 'fedora' ]]; then
+		case "${OS_FAMILY}" in
+		debian)
+			apt-get -o DPkg::Lock::Timeout=300 remove -y wireguard wireguard-tools qrencode
+			;;
+		rhel)
 			dnf remove -y --noautoremove wireguard-tools qrencode
-			if [[ ${VERSION_ID} -lt 32 ]]; then
-				dnf remove -y --noautoremove wireguard-dkms
-				dnf copr disable -y jdoss/wireguard
+			if [[ ${OS} != 'fedora' && ${VERSION_ID%%.*} == 8 ]]; then
+				dnf remove -y --noautoremove kmod-wireguard
 			fi
-		elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-			yum remove -y --noautoremove wireguard-tools
-			if [[ ${VERSION_ID} == 8* ]]; then
-				yum remove --noautoremove kmod-wireguard qrencode
-			fi
-		elif [[ ${OS} == 'oracle' ]]; then
-			yum remove --noautoremove wireguard-tools qrencode
-		elif [[ ${OS} == 'arch' ]]; then
-			pacman -Rs --noconfirm wireguard-tools qrencode
-		elif [[ ${OS} == 'flatcar' ]]; then
-			# Flatcar provides the required WireGuard tooling natively
-			:
-		elif [[ ${OS} == 'alpine' ]]; then
-			(cd qrencode-4.1.1 || exit && make uninstall)
-			rm -rf qrencode-* || exit
-			apk del wireguard-tools libqrencode libqrencode-tools
-		fi
+			;;
+		arch)
+			local PACKAGE
+			for PACKAGE in wireguard-tools qrencode; do
+				if pacman -Qi "${PACKAGE}" &>/dev/null; then
+					pacman -Rs --noconfirm "${PACKAGE}"
+				fi
+			done
+			;;
+		suse)
+			zypper --non-interactive remove wireguard-tools qrencode
+			;;
+		flatcar)
+			# Flatcar ships WireGuard in its read-only /usr, nothing to remove
+			;;
+		esac
 
 		rm -rf /etc/wireguard
 		rm -f /etc/sysctl.d/wg.conf
 
-		if [[ ${OS} == 'alpine' ]]; then
-			rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status &>/dev/null
-		else
-			# Reload sysctl
-			sysctl --system
+		# Reload sysctl
+		sysctl --system >/dev/null
 
-			# Check if WireGuard is running
-			systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
-		fi
+		# Check if WireGuard is running
+		systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
 		WG_RUNNING=$?
 
 		if [[ ${WG_RUNNING} -eq 0 ]]; then
@@ -1115,7 +1103,7 @@ function uninstallWg() {
 
 function manageMenu() {
 	echo "Welcome to WireGuard-install!"
-	echo "The git repository is available at: https://github.com/angristan/wireguard-install"
+	echo "The git repository is available at: https://github.com/tbringuier/wireguard-install"
 	echo ""
 	echo "It looks like WireGuard is already installed."
 	echo ""
