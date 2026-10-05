@@ -90,25 +90,15 @@ assertTrue "mixed mode across families" validateClientAddressMode mixed "" 203.0
 assertFalse "mixed mode with only private" validateClientAddressMode mixed 10.66.66.2 "" "" ""
 assertFalse "unknown mode" validateClientAddressMode bogus 10.66.66.2 "" "" ""
 
-# --- client hooks and configuration ---
-HOOKS=$(buildClientHookBlock wg0 203.0.113.5 "")
-assertContains "v4 clamp PostUp" "PostUp = iptables -t mangle -A POSTROUTING" "${HOOKS}"
-assertContains "v4 clamp PostDown" "PostDown = iptables -t mangle -D POSTROUTING" "${HOOKS}"
-assertNotContains "no v6 clamp without public v6" "ip6tables" "${HOOKS}"
-HOOKS=$(buildClientHookBlock wg0 "" 2001:db8::5)
-assertContains "v6 clamp only" "ip6tables -t mangle -A POSTROUTING" "${HOOKS}"
-assertNotContains "no v4 clamp without public v4" "PostUp = iptables" "${HOOKS}"
-assertEquals "4 hook lines when both" 4 "$(buildClientHookBlock wg0 203.0.113.5 2001:db8::5 | wc -l)"
-assertEquals "no hooks for private clients" "" "$(buildClientHookBlock wg0 "" "")"
-
-CLIENT=$(buildClientConfig private wg0 CPRIV SPUB PSK 198.51.100.1:51820 0.0.0.0/0,::/0 1.1.1.1 1.0.0.1 10.66.66.2 "" fd42:42:42::2 "")
+# --- client configuration ---
+CLIENT=$(buildClientConfig 1420 CPRIV SPUB PSK 198.51.100.1:51820 0.0.0.0/0,::/0 1.1.1.1 1.0.0.1 10.66.66.2 "" fd42:42:42::2 "")
 assertContains "private client address" "Address = 10.66.66.2/32,fd42:42:42::2/128" "${CLIENT}"
-assertNotContains "private client has no hooks" "PostUp" "${CLIENT}"
+assertContains "client mtu follows the server" "MTU = 1420" "${CLIENT}"
+assertNotContains "clients carry no hooks" "PostUp" "${CLIENT}"
 assertContains "client keepalive" "PersistentKeepalive = 15" "${CLIENT}"
 assertContains "client endpoint" "Endpoint = 198.51.100.1:51820" "${CLIENT}"
-CLIENT=$(buildClientConfig public wg0 CPRIV SPUB PSK "[2001:db8::1]:51820" 0.0.0.0/0,::/0 1.1.1.1 1.0.0.1 "" 203.0.113.5 "" "")
+CLIENT=$(buildClientConfig 1380 CPRIV SPUB PSK "[2001:db8::1]:51820" 0.0.0.0/0,::/0 1.1.1.1 1.0.0.1 "" 203.0.113.5 "" "")
 assertContains "public client address" "Address = 203.0.113.5/32" "${CLIENT}"
-assertContains "public client clamp" "TCPMSS --clamp-mss-to-pmtu" "${CLIENT}"
 assertContains "bracketed IPv6 endpoint" "Endpoint = [2001:db8::1]:51820" "${CLIENT}"
 
 # --- server peer blocks and extraction ---
@@ -144,49 +134,42 @@ SYSCTL=$(buildSysctlConfig no ens3)
 assertNotContains "no proxy ndp in classic mode" "proxy_ndp" "${SYSCTL}"
 assertContains "accept_ra follows the nic name" "net.ipv6.conf.ens3.accept_ra = 2" "${SYSCTL}"
 
-# --- firewall rule blocks ---
+# --- nftables ruleset and hooks ---
+RULESET=$(buildNftRuleset eth0 wg0 10.66.66.1 fd42:42:42::1 1420)
+assertContains "ruleset is idempotent" $'table inet wireguard\ndelete table inet wireguard\ntable inet wireguard {' "${RULESET}"
+assertContains "private v4 NAT" 'oifname "eth0" ip saddr 10.66.66.0/24 masquerade' "${RULESET}"
+assertContains "private v6 NAT" 'oifname "eth0" ip6 saddr fd42:42:42::/64 masquerade' "${RULESET}"
+assertContains "v4 MSS clamp into the tunnel" 'meta nfproto ipv4 oifname "wg0" tcp flags syn tcp option maxseg size > 1380 tcp option maxseg size set 1380' "${RULESET}"
+assertContains "v4 MSS clamp out of the tunnel" 'meta nfproto ipv4 iifname "wg0" tcp flags syn tcp option maxseg size > 1380 tcp option maxseg size set 1380' "${RULESET}"
+assertContains "v6 MSS clamp" 'meta nfproto ipv6 oifname "wg0" tcp flags syn tcp option maxseg size > 1360 tcp option maxseg size set 1360' "${RULESET}"
+assertNotContains "no accept rules of our own" "accept
+" "${RULESET//policy accept;/}"
+assertContains "MSS follows the MTU" "maxseg size set 1300" "$(buildNftRuleset eth0 wg0 10.66.66.1 fd42:42:42::1 1340)"
+if command -v nft &>/dev/null && [[ ${EUID} -eq 0 ]]; then
+	# Even the check mode needs netlink access, so this only runs as root
+	assertTrue "ruleset parses with nft" nft -c -f <(echo "${RULESET}")
+fi
+
 function assertSymmetricHooks() {
-	# Every PostUp must have a matching PostDown once insert/append become delete
+	# Every PostUp must have a matching PostDown
 	local DESCRIPTION=$1
 	local RULES=$2
 	local UPS DOWNS
-	UPS=$(echo "${RULES}" | sed -n 's/^PostUp = //p' | sed -e 's/ -I / -D /; s/ -A / -D /; s/neigh replace proxy/neigh del proxy/' | sort)
+	UPS=$(echo "${RULES}" | sed -n 's/^PostUp = //p' | sed -e 's#nft -f /etc/wireguard/.*#nft delete table inet wireguard#; s/neigh replace proxy/neigh del proxy/' | sort)
 	DOWNS=$(echo "${RULES}" | sed -n 's/^PostDown = //p' | sed 's/ || true$//' | sort)
 	assertEquals "${DESCRIPTION}: PostUp/PostDown symmetry" "${UPS}" "${DOWNS}"
 }
 
-RULES=$(buildManagedRuleBlock 51820 eth0 wg0 10.66.66.1 fd42:42:42::1 $'203.0.113.5\n203.0.113.6' "2001:db8::5")
-assertSymmetricHooks "managed rules" "${RULES}"
-assertContains "udp port" "iptables -I INPUT -p udp --dport 51820 -j ACCEPT" "${RULES}"
-assertContains "private v4 NAT only" "POSTROUTING -o eth0 -s 10.66.66.0/24 -j MASQUERADE" "${RULES}"
-assertNotContains "public addresses are not NATed" "203.0.113.5/32 -j MASQUERADE" "${RULES}"
-assertContains "public v4 forward in" "iptables -I FORWARD -i eth0 -o wg0 -d 203.0.113.6/32 -j ACCEPT" "${RULES}"
-assertContains "public v4 forward out" "iptables -I FORWARD -i wg0 -s 203.0.113.5/32 -j ACCEPT" "${RULES}"
-assertContains "public v6 forward" "ip6tables -I FORWARD -i eth0 -o wg0 -d 2001:db8::5/128 -j ACCEPT" "${RULES}"
-assertContains "arp proxy" "ip -4 neigh replace proxy 203.0.113.6 dev eth0" "${RULES}"
-assertContains "ndp proxy" "ip -6 neigh replace proxy 2001:db8::5 dev eth0" "${RULES}"
-assertContains "ndp proxy removal tolerates absence" "ip -6 neigh del proxy 2001:db8::5 dev eth0 || true" "${RULES}"
-assertContains "server side mss clamp" "iptables -t mangle -A FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "${RULES}"
-RULES=$(buildManagedRuleBlock 51820 eth0 wg0 10.66.66.1 fd42:42:42::1 "" "")
-assertSymmetricHooks "managed rules without public addresses" "${RULES}"
-assertNotContains "no per-address rule without public addresses" "/32 -j ACCEPT" "${RULES}"
-
-RULES=$(buildClassicIptablesRuleBlock 51820 eth0 wg0)
-assertSymmetricHooks "classic rules" "${RULES}"
-assertContains "classic NAT" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "${RULES}"
-assertContains "classic mss clamp" "TCPMSS --clamp-mss-to-pmtu" "${RULES}"
-
-RULES=$(buildClassicFirewalldRuleBlock 51820 wg0 10.66.66.1 fd42:42:42::1)
-assertContains "firewalld adds the interface" "--zone=public --add-interface=wg0" "${RULES}"
-assertContains "firewalld removes the interface on PostDown" "--zone=public --remove-interface=wg0" "${RULES}"
-assertContains "firewalld v4 masquerade" "source address=10.66.66.0/24 masquerade" "${RULES}"
-assertContains "firewalld v6 masquerade" "source address=fd42:42:42::0/64 masquerade" "${RULES}"
-
-assertEquals "backend: public routing" public-routing "$(selectFirewallBackend yes no)"
-assertEquals "backend: firewalld" firewalld "$(selectFirewallBackend no yes)"
-assertEquals "backend: iptables" iptables "$(selectFirewallBackend no no)"
-assertFalse "public routing refuses firewalld" validatePublicRoutingEnvironment yes yes >/dev/null
-assertTrue "classic mode accepts firewalld" validatePublicRoutingEnvironment no yes
+HOOKS=$(buildHookBlock wg0 eth0 $'203.0.113.5\n203.0.113.6' "2001:db8::5")
+assertSymmetricHooks "hooks with public addresses" "${HOOKS}"
+assertContains "ruleset loaded on PostUp" "PostUp = nft -f /etc/wireguard/wg0.nft" "${HOOKS}"
+assertContains "ruleset removed on PostDown" "PostDown = nft delete table inet wireguard || true" "${HOOKS}"
+assertContains "arp proxy" "PostUp = ip -4 neigh replace proxy 203.0.113.6 dev eth0" "${HOOKS}"
+assertContains "ndp proxy" "PostUp = ip -6 neigh replace proxy 2001:db8::5 dev eth0" "${HOOKS}"
+assertContains "proxy removal tolerates absence" "PostDown = ip -6 neigh del proxy 2001:db8::5 dev eth0 || true" "${HOOKS}"
+assertEquals "hooks without public addresses" 2 "$(buildHookBlock wg0 eth0 "" "" | wc -l)"
+printf '[Interface]\n%s\n' "${HOOKS}" >"${TMP_CONF}"
+assertEquals "proxy entries extracted" $'-4 203.0.113.5 dev eth0\n-4 203.0.113.6 dev eth0\n-6 2001:db8::5 dev eth0' "$(listProxyEntries "${TMP_CONF}")"
 
 # --- announcement service ---
 ENV_FILE=$(buildAnnouncementEnvironment eth0 "203.0.113.5 203.0.113.6")

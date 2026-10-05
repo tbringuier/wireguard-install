@@ -85,6 +85,7 @@ runInstaller <<ANSWERS
 198.51.100.1
 ${NIC}
 wg0
+1420
 10.66.66.1
 fd42:42:42::1
 51820
@@ -106,10 +107,10 @@ check "announcement unit is enabled" systemctl is-enabled --quiet wg-public-ipv4
 check "announcement unit logs its addresses" sh -c 'journalctl -u wg-public-ipv4-announce@wg0 --no-pager | grep -q "Announcing 203.0.113.50 on"'
 check "announcement unit has no failures" sh -c '! journalctl -u wg-public-ipv4-announce@wg0 --no-pager | grep -q -E "Cannot announce|Traceback"'
 check "legacy unit removed" sh -c '! test -e /etc/systemd/system/wg-public-ipv4-arping.service'
-check "public v4 forward rule" sh -c 'iptables -S FORWARD | grep -q -- "-d 203.0.113.50/32"'
-check "public v6 forward rule" sh -c 'ip6tables -S FORWARD | grep -q -- "-d 2001:db8::50/128"'
-check "mss clamp on the server" sh -c 'iptables -t mangle -S FORWARD | grep -q -- "--clamp-mss-to-pmtu"'
-check "private subnet is NATed" sh -c 'iptables -t nat -S POSTROUTING | grep -q -- "-s 10.66.66.0/24 .*MASQUERADE"'
+check "nft table loaded" nft list table inet wireguard
+check "mss clamp on the server" sh -c 'nft list table inet wireguard | grep -q "maxseg size set 1380"'
+check "private subnet is NATed" sh -c 'nft list table inet wireguard | grep -q "ip saddr 10.66.66.0/24 masquerade"'
+check "tunnel mtu applied" sh -c 'ip link show wg0 | grep -q "mtu 1420"'
 check "arp proxy entry" sh -c 'ip -4 neigh show proxy | grep -q 203.0.113.50'
 check "ndp proxy entry" sh -c 'ip -6 neigh show proxy | grep -q 2001:db8::50'
 check "proxy_ndp enabled" sh -c '[ "$(sysctl -n net.ipv6.conf.all.proxy_ndp)" = 1 ]'
@@ -117,7 +118,7 @@ check "forwarding enabled" sh -c '[ "$(sysctl -n net.ipv4.ip_forward)" = 1 ] && 
 check "accept_ra on the public nic" sh -c "[ \"\$(sysctl -n net.ipv6.conf.${NIC}.accept_ra)\" = 2 ]"
 check "client file written" test -s /root/wg0-client-alice.conf
 check "client addresses" grep -q "Address = 203.0.113.50/32,2001:db8::50/128" /root/wg0-client-alice.conf
-check "client mss clamp for both families" sh -c 'grep -q "PostUp = iptables -t mangle" /root/wg0-client-alice.conf && grep -q "PostUp = ip6tables -t mangle" /root/wg0-client-alice.conf'
+check "client carries the tunnel mtu and no hooks" sh -c 'grep -q "MTU = 1420" /root/wg0-client-alice.conf && ! grep -q PostUp /root/wg0-client-alice.conf'
 check "client file is private" sh -c '[ "$(stat -c %a /root/wg0-client-alice.conf)" = 600 ]'
 check "server config is private" sh -c '[ "$(stat -c %a /etc/wireguard/wg0.conf)" = 600 ] && [ "$(stat -c %a /etc/wireguard)" = 700 ]'
 check "env file is private" sh -c '[ "$(stat -c %a /etc/wireguard/public-ipv4-announce-wg0.env)" = 600 ]'
@@ -149,7 +150,8 @@ ANSWERS
 check "three peers" sh -c '[ "$(wg show wg0 peers | wc -l)" = 3 ]'
 check "both public addresses announced" grep -q 'PUBLIC_IPV4_LIST="203.0.113.50 203.0.113.51"' /etc/wireguard/public-ipv4-announce-wg0.env
 check "announcement restarted with both" sh -c 'journalctl -u wg-public-ipv4-announce@wg0 --no-pager | grep -q "Announcing 203.0.113.50 203.0.113.51 on"'
-check "second public forward rule" sh -c 'iptables -S FORWARD | grep -q -- "-d 203.0.113.51/32"'
+check "second arp proxy entry" sh -c 'ip -4 neigh show proxy | grep -q 203.0.113.51'
+check "public client added without restart" sh -c "[ \"\$(systemctl show -p ActiveEnterTimestamp --value wg-quick@wg0)\" = '${STARTED_BEFORE}' ]"
 
 echo "== reject a duplicate client name and a bad address, then succeed"
 runInstaller <<ANSWERS
@@ -179,10 +181,10 @@ runInstaller <<ANSWERS
 1
 ANSWERS
 check "three peers left" sh -c '[ "$(wg show wg0 peers | wc -l)" = 3 ]'
-check "public v4 rule removed" sh -c '! iptables -S FORWARD | grep -q -- "-d 203.0.113.50/32"'
 check "arp proxy entry removed" sh -c '! ip -4 neigh show proxy | grep -q 203.0.113.50'
 check "ndp proxy entry removed" sh -c '! ip -6 neigh show proxy | grep -q 2001:db8::50'
-check "remaining public rule kept" sh -c 'iptables -S FORWARD | grep -q -- "-d 203.0.113.51/32"'
+check "remaining arp proxy kept" sh -c 'ip -4 neigh show proxy | grep -q 203.0.113.51'
+check "public client revoked without restart" sh -c "[ \"\$(systemctl show -p ActiveEnterTimestamp --value wg-quick@wg0)\" = '${STARTED_BEFORE}' ]"
 check "client file removed" sh -c '! test -e /root/wg0-client-alice.conf'
 check "announcement keeps the remaining address" grep -q 'PUBLIC_IPV4_LIST="203.0.113.51"' /etc/wireguard/public-ipv4-announce-wg0.env
 check "announcement unit still active" systemctl is-active --quiet wg-public-ipv4-announce@wg0
@@ -207,6 +209,7 @@ check "tunnel stopped" sh -c '! systemctl is-active --quiet wg-quick@wg0'
 check "configuration removed" sh -c '! test -e /etc/wireguard'
 check "sysctl file removed" sh -c '! test -e /etc/sysctl.d/wg.conf'
 check "unit file removed" sh -c '! test -e /etc/systemd/system/wg-public-ipv4-announce@.service'
+check "nft table removed" sh -c '! nft list table inet wireguard >/dev/null 2>&1'
 check "no wants symlink left" sh -c '! test -e /etc/systemd/system/wg-quick@wg0.service.wants'
 check "proxy_ndp reset" sh -c '[ "$(sysctl -n net.ipv6.conf.all.proxy_ndp)" = 0 ]'
 check "no proxy entries left" sh -c '[ -z "$(ip -4 neigh show proxy)" ] && [ -z "$(ip -6 neigh show proxy)" ]'
@@ -216,6 +219,7 @@ runInstaller <<ANSWERS
 198.51.100.1
 ${NIC}
 wg0
+1420
 10.66.66.1
 fd42:42:42::1
 51820
@@ -229,8 +233,8 @@ erin
 fd42:42:42::2
 ANSWERS
 check "classic tunnel active" systemctl is-active --quiet wg-quick@wg0
-check "classic NAT rule" sh -c 'iptables -t nat -S POSTROUTING | grep -q -- "-o '"${NIC}"' -j MASQUERADE"'
-check "classic mss clamp" sh -c 'iptables -t mangle -S FORWARD | grep -q -- "--clamp-mss-to-pmtu"'
+check "classic NAT rule" sh -c 'nft list table inet wireguard | grep -q "ip saddr 10.66.66.0/24 masquerade"'
+check "classic mss clamp" sh -c 'nft list table inet wireguard | grep -q "maxseg size set 1380"'
 check "no proxy_ndp in classic mode" sh -c '[ "$(sysctl -n net.ipv6.conf.all.proxy_ndp)" = 0 ]'
 check "no announcement unit in classic mode" sh -c '! test -e /etc/systemd/system/wg-public-ipv4-announce@.service'
 check "classic client has no hooks" sh -c '! grep -q PostUp /root/wg0-client-erin.conf'
