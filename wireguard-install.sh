@@ -722,6 +722,78 @@ function detectPublicNic() {
 	echo "${NIC}"
 }
 
+function detectHostFirewall() {
+	if systemctl is-active --quiet firewalld; then
+		echo firewalld
+	elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+		echo ufw
+	else
+		echo none
+	fi
+}
+
+function firewalldPublicZone() {
+	firewall-cmd --get-zone-of-interface="${SERVER_PUB_NIC}" 2>/dev/null || firewall-cmd --get-default-zone
+}
+
+function applyFirewallIntegration() {
+	# Open the listening port and allow forwarding on the tunnel in the host firewall
+	local PUBLIC_ZONE
+
+	case "${FIREWALL_INTEGRATION}" in
+	ufw)
+		ufw allow "${SERVER_PORT}/udp" >/dev/null
+		ufw route allow in on "${SERVER_WG_NIC}" >/dev/null
+		ufw route allow out on "${SERVER_WG_NIC}" >/dev/null
+		;;
+	firewalld)
+		PUBLIC_ZONE=$(firewalldPublicZone)
+		firewall-cmd --permanent --zone="${PUBLIC_ZONE}" --add-port="${SERVER_PORT}/udp" >/dev/null
+		firewall-cmd --permanent --zone=trusted --add-interface="${SERVER_WG_NIC}" >/dev/null
+		firewall-cmd --permanent --new-policy=wg-forward-out >/dev/null 2>&1 || true
+		firewall-cmd --permanent --policy=wg-forward-out --add-ingress-zone=trusted >/dev/null
+		firewall-cmd --permanent --policy=wg-forward-out --add-egress-zone="${PUBLIC_ZONE}" >/dev/null
+		firewall-cmd --permanent --policy=wg-forward-out --set-target=ACCEPT >/dev/null
+		firewall-cmd --permanent --new-policy=wg-forward-in >/dev/null 2>&1 || true
+		firewall-cmd --permanent --policy=wg-forward-in --add-ingress-zone="${PUBLIC_ZONE}" >/dev/null
+		firewall-cmd --permanent --policy=wg-forward-in --add-egress-zone=trusted >/dev/null
+		firewall-cmd --permanent --policy=wg-forward-in --set-target=ACCEPT >/dev/null
+		firewall-cmd --reload >/dev/null
+		;;
+	esac
+}
+
+function removeFirewallIntegration() {
+	local PUBLIC_ZONE
+
+	case "${FIREWALL_INTEGRATION}" in
+	ufw)
+		ufw --force delete allow "${SERVER_PORT}/udp" >/dev/null 2>&1
+		ufw --force route delete allow in on "${SERVER_WG_NIC}" >/dev/null 2>&1
+		ufw --force route delete allow out on "${SERVER_WG_NIC}" >/dev/null 2>&1
+		;;
+	firewalld)
+		PUBLIC_ZONE=$(firewalldPublicZone)
+		firewall-cmd --permanent --zone="${PUBLIC_ZONE}" --remove-port="${SERVER_PORT}/udp" >/dev/null 2>&1
+		firewall-cmd --permanent --zone=trusted --remove-interface="${SERVER_WG_NIC}" >/dev/null 2>&1
+		firewall-cmd --permanent --delete-policy=wg-forward-out >/dev/null 2>&1
+		firewall-cmd --permanent --delete-policy=wg-forward-in >/dev/null 2>&1
+		firewall-cmd --reload >/dev/null 2>&1
+		;;
+	esac
+}
+
+function warnAboutOtherFirewalls() {
+	# Filters the installer does not manage but that drop forwarded traffic
+	if systemctl is-active --quiet docker; then
+		echo -e "${ORANGE}Docker is running and its FORWARD policy drops unknown traffic. If clients have no connectivity, run:${NC}"
+		echo "  iptables -I DOCKER-USER -i ${SERVER_WG_NIC} -j ACCEPT; iptables -I DOCKER-USER -o ${SERVER_WG_NIC} -j ACCEPT"
+	fi
+	if [[ $(detectHostFirewall) == none ]] && nft list ruleset 2>/dev/null | grep -qE 'hook (input|forward).*policy drop'; then
+		echo -e "${ORANGE}An nftables ruleset with a drop policy is loaded: it must accept UDP port ${SERVER_PORT} and forwarding on ${SERVER_WG_NIC}.${NC}"
+	fi
+}
+
 function installQuestions() {
 	echo "Welcome to the WireGuard installer!"
 	echo "The git repository is available at: https://github.com/tbringuier/wireguard-install"
@@ -785,6 +857,20 @@ function installQuestions() {
 	until [[ ${PUBLIC_ROUTING_MODE} =~ ^(yes|no)$ ]]; do
 		read -rp "Enable public IP routing support [yes/no]: " -e -i no PUBLIC_ROUTING_MODE
 	done
+
+	HOST_FIREWALL=$(detectHostFirewall)
+	FIREWALL_INTEGRATION=none
+	if [[ ${HOST_FIREWALL} != none ]]; then
+		echo ""
+		echo "${HOST_FIREWALL} is active and drops forwarded traffic by default. WireGuard needs UDP port ${SERVER_PORT}"
+		echo "open and forwarding allowed on ${SERVER_WG_NIC}; the installer can add these rules and remove them on uninstall."
+		until [[ ${ADD_FIREWALL_RULES} =~ ^(y|n)$ ]]; do
+			read -rp "Add the WireGuard rules to ${HOST_FIREWALL}? [y/n]: " -e -i y ADD_FIREWALL_RULES
+		done
+		if [[ ${ADD_FIREWALL_RULES} == y ]]; then
+			FIREWALL_INTEGRATION=${HOST_FIREWALL}
+		fi
+	fi
 
 	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
 		echo -e "\nWireGuard uses a parameter called AllowedIPs to determine what is routed over the VPN."
@@ -894,7 +980,8 @@ CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
 ALLOWED_IPS=${ALLOWED_IPS}
 PUBLIC_ROUTING_MODE=${PUBLIC_ROUTING_MODE}
-SERVER_WG_MTU=${SERVER_WG_MTU}" >/etc/wireguard/params
+SERVER_WG_MTU=${SERVER_WG_MTU}
+FIREWALL_INTEGRATION=${FIREWALL_INTEGRATION}" >/etc/wireguard/params
 	chmod 600 /etc/wireguard/params
 
 	# Add server interface
@@ -906,6 +993,7 @@ SERVER_WG_MTU=${SERVER_WG_MTU}" >/etc/wireguard/params
 	applySysctlConfig
 
 	systemctl enable --now "wg-quick@${SERVER_WG_NIC}"
+	applyFirewallIntegration
 
 	refreshPublicIpv4AnnouncementService
 
@@ -926,6 +1014,7 @@ SERVER_WG_MTU=${SERVER_WG_MTU}" >/etc/wireguard/params
 		echo -e "${GREEN}You can check the status of WireGuard with: systemctl status wg-quick@${SERVER_WG_NIC}\n\n${NC}"
 		echo -e "${ORANGE}If you don't have internet connectivity from your client, try to reboot the server.${NC}"
 	fi
+	warnAboutOtherFirewalls
 }
 
 function readClientAddress() {
@@ -1163,6 +1252,7 @@ function uninstallWg() {
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == 'y' ]]; then
 		removePublicIpv4AnnouncementService
+		removeFirewallIntegration
 
 		systemctl disable --now "wg-quick@${SERVER_WG_NIC}"
 		nft delete table inet wireguard 2>/dev/null
@@ -1223,6 +1313,7 @@ function loadParams() {
 
 	# Installations made by earlier versions lack these keys
 	SERVER_WG_MTU=${SERVER_WG_MTU:-1420}
+	FIREWALL_INTEGRATION=${FIREWALL_INTEGRATION:-none}
 }
 
 function manageMenu() {
