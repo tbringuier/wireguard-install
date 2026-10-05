@@ -34,6 +34,28 @@ function isPrivateIpv4() {
 		[[ $1 =~ ^169\.254\. ]]
 }
 
+function isValidIpv6Prefix() {
+	[[ $1 =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || return 1
+	if command -v python3 &>/dev/null; then
+		python3 -c 'import ipaddress, sys; ipaddress.ip_network(sys.argv[1], strict=False)' "$1" 2>/dev/null
+	fi
+}
+
+function suggestPublicIpv6() {
+	# suggestPublicIpv6 <prefix> [excluded address...]: first free host address from ::2
+	python3 - "$@" 2>/dev/null <<'PYTHON'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=False)
+excluded = {ipaddress.ip_address(address) for address in sys.argv[2:]}
+for offset in range(2, min(network.num_addresses, 65536)):
+    if network[offset] not in excluded:
+        print(network[offset])
+        break
+PYTHON
+}
+
 function buildClientAddressLine() {
 	local PRIVATE_IPV4=$1
 	local PUBLIC_IPV4=$2
@@ -724,6 +746,24 @@ function detectPublicIpv6() {
 	ip -6 -o addr show scope global 2>/dev/null | awk '{ print $4 }' | cut -d '/' -f 1 | grep -v -i -E '^f[cd]' | head -1
 }
 
+function detectPublicIpv6Prefix() {
+	# detectPublicIpv6Prefix <nic>: first global, non-ULA network of /64 or shorter
+	ip -6 -o addr show dev "$1" scope global 2>/dev/null | awk '{ print $4 }' | grep -v -i -E '^f[cd]' | python3 -c '
+import ipaddress
+import sys
+
+for line in sys.stdin:
+    network = ipaddress.ip_interface(line.strip()).network
+    if network.prefixlen <= 64:
+        print(network)
+        break
+' 2>/dev/null
+}
+
+function listServerIpv6Addresses() {
+	ip -6 -o addr show dev "${SERVER_PUB_NIC}" scope global 2>/dev/null | awk '{ print $4 }' | cut -d '/' -f 1
+}
+
 function readOptionalValue() {
 	# readOptionalValue <variable> <prompt> <default> <validator>: empty is accepted
 	local VARIABLE=$1
@@ -895,6 +935,12 @@ function installQuestions() {
 		read -rp "Enable public IP routing support [yes/no]: " -e -i no PUBLIC_ROUTING_MODE
 	done
 
+	SERVER_PUB_IPV6_PREFIX=""
+	if [[ ${PUBLIC_ROUTING_MODE} == yes ]]; then
+		echo "Public clients can get an IPv6 from the block your provider routes to this server."
+		readOptionalValue SERVER_PUB_IPV6_PREFIX "Public IPv6 prefix of this server (empty if none)" "$(detectPublicIpv6Prefix "${SERVER_PUB_NIC}")" isValidIpv6Prefix
+	fi
+
 	HOST_FIREWALL=$(detectHostFirewall)
 	FIREWALL_INTEGRATION=none
 	if [[ ${HOST_FIREWALL} != none ]]; then
@@ -934,15 +980,12 @@ function installWireGuard() {
 		# cloud-init or unattended-upgrades may still hold the dpkg lock after boot
 		local APT_GET=(apt-get -o DPkg::Lock::Timeout=300)
 		"${APT_GET[@]}" update
-		installPackages "${APT_GET[@]}" install -y wireguard-tools nftables
+		installPackages "${APT_GET[@]}" install -y wireguard-tools nftables python3
 		if ! hasWireGuardKernelSupport; then
 			# Kernel older than 5.6: the metapackage pulls the DKMS module
 			installOptionalPackages "${APT_GET[@]}" install -y wireguard
 		fi
 		installOptionalPackages "${APT_GET[@]}" install -y qrencode
-		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installOptionalPackages "${APT_GET[@]}" install -y python3
-		fi
 		;;
 	rhel)
 		if [[ ${OS} == 'ol' && ${VERSION_ID%%.*} == 8 ]]; then
@@ -959,25 +1002,16 @@ function installWireGuard() {
 			# qrencode lives in EPEL on Enterprise Linux
 			installOptionalPackages dnf install -y epel-release
 		fi
-		installPackages dnf install -y wireguard-tools nftables
+		installPackages dnf install -y wireguard-tools nftables python3
 		installOptionalPackages dnf install -y qrencode
-		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installOptionalPackages dnf install -y python3
-		fi
 		;;
 	arch)
-		installPackages pacman -S --needed --noconfirm wireguard-tools nftables
+		installPackages pacman -S --needed --noconfirm wireguard-tools nftables python
 		installOptionalPackages pacman -S --needed --noconfirm qrencode
-		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installOptionalPackages pacman -S --needed --noconfirm python
-		fi
 		;;
 	suse)
-		installPackages zypper --non-interactive install wireguard-tools nftables
+		installPackages zypper --non-interactive install wireguard-tools nftables python3
 		installOptionalPackages zypper --non-interactive install qrencode
-		if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
-			installOptionalPackages zypper --non-interactive install python3
-		fi
 		;;
 	flatcar)
 		# Flatcar ships WireGuard and nftables in its read-only /usr
@@ -996,6 +1030,9 @@ function installWireGuard() {
 	if ! command -v nft &>/dev/null; then
 		echo -e "${RED}The nft command is required (nftables package).${NC}"
 		exit 1
+	fi
+	if ! command -v python3 &>/dev/null; then
+		echo -e "${ORANGE}python3 is missing: public IPv4 announcements and IPv6 suggestions are unavailable.${NC}"
 	fi
 
 	# Make sure the directory exists with restrictive permissions
@@ -1019,6 +1056,7 @@ CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
 ALLOWED_IPS=${ALLOWED_IPS}
 PUBLIC_ROUTING_MODE=${PUBLIC_ROUTING_MODE}
+SERVER_PUB_IPV6_PREFIX=${SERVER_PUB_IPV6_PREFIX}
 SERVER_WG_MTU=${SERVER_WG_MTU}
 FIREWALL_INTEGRATION=${FIREWALL_INTEGRATION}" >/etc/wireguard/params
 	chmod 600 /etc/wireguard/params
@@ -1201,7 +1239,16 @@ function newClient() {
 		echo ""
 		echo "Public addresses must be routed to this server by your provider (additional/failover IP)."
 		readClientAddress CLIENT_PUBLIC_IPV4 "Public client IPv4" "" ipv4 public
-		readClientAddress CLIENT_PUBLIC_IPV6 "Public client IPv6" "" ipv6 public
+		DEFAULT_PUBLIC_IPV6=""
+		if [[ -n ${SERVER_PUB_IPV6_PREFIX} ]]; then
+			mapfile -t USED_IPV6 < <({
+				echo "${SERVER_PUB_IPV6}"
+				listServerIpv6Addresses
+				listPublicAddresses PublicIPv6 "$(getPeerBlocksFromConfig "${WG_CONF_FILE}")"
+			} | grep -v '^$')
+			DEFAULT_PUBLIC_IPV6=$(suggestPublicIpv6 "${SERVER_PUB_IPV6_PREFIX}" "${USED_IPV6[@]}")
+		fi
+		readClientAddress CLIENT_PUBLIC_IPV6 "Public client IPv6" "${DEFAULT_PUBLIC_IPV6}" ipv6 public
 	fi
 
 	if ! validateClientAddressMode \
@@ -1392,6 +1439,7 @@ function loadParams() {
 	SERVER_PUB_IPV4=${SERVER_PUB_IPV4:-}
 	SERVER_PUB_IPV6=${SERVER_PUB_IPV6:-}
 	SERVER_HOSTNAME=${SERVER_HOSTNAME:-}
+	SERVER_PUB_IPV6_PREFIX=${SERVER_PUB_IPV6_PREFIX:-}
 	if [[ -n ${SERVER_PUB_IP:-} && -z ${SERVER_PUB_IPV4}${SERVER_PUB_IPV6}${SERVER_HOSTNAME} ]]; then
 		local LEGACY_ENDPOINT=${SERVER_PUB_IP//[\[\]]/}
 		if isValidIpv4 "${LEGACY_ENDPOINT}"; then

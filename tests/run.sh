@@ -71,6 +71,19 @@ for IP in 172.32.0.1 100.128.0.1 8.8.8.8 163.5.121.254 11.0.0.1; do
 	assertFalse "isPrivateIpv4 ${IP}" isPrivateIpv4 "${IP}"
 done
 
+if command -v python3 &>/dev/null; then
+	for PREFIX in 2001:db8::/64 2001:db8:1::/48 2001:db8::1/64 ::/0; do
+		assertTrue "isValidIpv6Prefix ${PREFIX}" isValidIpv6Prefix "${PREFIX}"
+	done
+	for PREFIX in 2001:db8::/129 2001:db8:: "2001:db8::/64 x" 1.2.3.0/24; do
+		assertFalse "isValidIpv6Prefix ${PREFIX}" isValidIpv6Prefix "${PREFIX}"
+	done
+	assertEquals "first suggestion starts at ::2" "2001:db8::2" "$(suggestPublicIpv6 2001:db8::/64)"
+	assertEquals "suggestion skips used addresses" "2001:db8::4" "$(suggestPublicIpv6 2001:db8::/64 2001:db8::2 2001:db8::3)"
+	assertEquals "suggestion follows the prefix length" "2001:db8::abc:3" "$(suggestPublicIpv6 2001:db8::abc:0/112 2001:db8::abc:2)"
+	assertEquals "no suggestion from a single address" "" "$(suggestPublicIpv6 2001:db8::1/128)"
+fi
+
 # --- client address lines and modes ---
 assertEquals "address line, mixed" "203.0.113.5/32,10.66.66.2/32,2001:db8::5/128,fd42:42:42::2/128" \
 	"$(buildClientAddressLine 10.66.66.2 203.0.113.5 fd42:42:42::2 2001:db8::5)"
