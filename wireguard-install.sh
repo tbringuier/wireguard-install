@@ -1,11 +1,12 @@
 #!/bin/bash
 
-# WireGuard server installer with public IP routing
+# WireGuard all-in-one server installer: NAT VPN, public IP routing to clients,
+# per-client endpoints, firewall integration and a status view.
 # https://github.com/tbringuier/wireguard-install
 #
 # Fork of https://github.com/angristan/wireguard-install (MIT licence).
-# Requires systemd. Tested on Debian, Ubuntu, Fedora, Rocky/Alma, Arch, openSUSE and Flatcar.
-# Most of this fork was written with Claude (Anthropic) and reviewed by the maintainer.
+# Requires systemd, nftables and Python 3. Tested on Debian, Ubuntu, Fedora, Rocky, Arch and openSUSE.
+# Most of this project was written with Claude (Anthropic) and reviewed by the maintainer.
 
 RED='\033[0;31m'
 ORANGE='\033[0;33m'
