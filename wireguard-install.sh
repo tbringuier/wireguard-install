@@ -11,6 +11,24 @@ ORANGE='\033[0;33m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
+function isValidIpv4() {
+	[[ $1 =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]
+}
+
+function isValidIpv6() {
+	# Hex groups separated by colons, with at most one "::" shortcut
+	[[ $1 =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] && [[ $1 != *:::* ]] && [[ $(echo "$1" | grep -o '::' | wc -l) -le 1 ]]
+}
+
+function isPrivateIpv4() {
+	# RFC 1918, RFC 6598 (carrier-grade NAT) and link-local ranges
+	[[ $1 =~ ^10\. ]] ||
+		[[ $1 =~ ^192\.168\. ]] ||
+		[[ $1 =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] ||
+		[[ $1 =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] ||
+		[[ $1 =~ ^169\.254\. ]]
+}
+
 function buildClientAddressLine() {
 	local PRIVATE_IPV4=$1
 	local PUBLIC_IPV4=$2
@@ -69,13 +87,24 @@ function buildPeerAllowedIps() {
 }
 
 function buildClientHookBlock() {
-	local CLIENT_ADDRESS_MODE=$1
-	local WG_INTERFACE=$2
+	local WG_INTERFACE=$1
+	local PUBLIC_IPV4=$2
+	local PUBLIC_IPV6=$3
+	local HOOKS=""
 
-	if [[ ${CLIENT_ADDRESS_MODE} == "public" ]] || [[ ${CLIENT_ADDRESS_MODE} == "mixed" ]]; then
-		echo "PostUp = iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WG_INTERFACE} -j TCPMSS --clamp-mss-to-pmtu
+	# Public clients often forward traffic further (containers, VMs...): clamp the
+	# TCP MSS to the tunnel MTU so those flows do not stall on fragmentation.
+	if [[ -n ${PUBLIC_IPV4} ]]; then
+		HOOKS="PostUp = iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WG_INTERFACE} -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WG_INTERFACE} -j TCPMSS --clamp-mss-to-pmtu"
 	fi
+	if [[ -n ${PUBLIC_IPV6} ]]; then
+		HOOKS="${HOOKS:+${HOOKS}
+}PostUp = ip6tables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WG_INTERFACE} -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip6tables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o ${WG_INTERFACE} -j TCPMSS --clamp-mss-to-pmtu"
+	fi
+
+	echo "${HOOKS}"
 }
 
 function validatePublicRoutingEnvironment() {
@@ -113,14 +142,18 @@ function validatePublicRoutingDependencies() {
 
 function buildSysctlConfig() {
 	local PUBLIC_ROUTING_MODE=$1
+	local SERVER_PUB_NIC=$2
+
+	echo "net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+# Enabling forwarding makes the kernel ignore router advertisements unless accept_ra=2,
+# which would silently drop the IPv6 default route on providers that use SLAAC.
+net.ipv6.conf.${SERVER_PUB_NIC}.accept_ra = 2"
 
 	if [[ ${PUBLIC_ROUTING_MODE} == "yes" ]]; then
-		echo "net.ipv4.ip_forward = 1
+		echo "# Answer ARP and NDP requests for the public addresses routed through the tunnel
 net.ipv4.conf.all.proxy_arp = 1
-net.ipv6.conf.all.forwarding = 1"
-	else
-		echo "net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1"
+net.ipv6.conf.all.proxy_ndp = 1"
 	fi
 }
 
@@ -141,20 +174,27 @@ function buildManagedRuleBlock() {
 	PRIVATE_IPV4_CIDR=$(echo "${SERVER_WG_IPV4}" | awk -F '.' '{ print $1 "." $2 "." $3 ".0/24" }')
 	PRIVATE_IPV6_CIDR="$(echo "${SERVER_WG_IPV6}" | awk -F '::' '{ print $1 }')::/64"
 
+	# Private addresses are NATed like in classic mode. Public addresses are
+	# forwarded as-is, and the TCP MSS of flows entering the tunnel is clamped
+	# so that clients which cannot run hooks (phones, Windows) work too.
 	RULES="PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PRIVATE_IPV4_CIDR} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -s ${PRIVATE_IPV4_CIDR} -j ACCEPT
 PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -s ${PRIVATE_IPV4_CIDR} -j MASQUERADE
+PostUp = iptables -t mangle -A FORWARD -o ${SERVER_WG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PRIVATE_IPV6_CIDR} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -s ${PRIVATE_IPV6_CIDR} -j ACCEPT
 PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -s ${PRIVATE_IPV6_CIDR} -j MASQUERADE
+PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_WG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PRIVATE_IPV4_CIDR} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -s ${PRIVATE_IPV4_CIDR} -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -s ${PRIVATE_IPV4_CIDR} -j MASQUERADE
+PostDown = iptables -t mangle -D FORWARD -o ${SERVER_WG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PRIVATE_IPV6_CIDR} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -s ${PRIVATE_IPV6_CIDR} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -s ${PRIVATE_IPV6_CIDR} -j MASQUERADE"
+PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -s ${PRIVATE_IPV6_CIDR} -j MASQUERADE
+PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_WG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 
 	while IFS= read -r PUBLIC_IPV4; do
 		[[ -n ${PUBLIC_IPV4} ]] || continue
@@ -165,13 +205,17 @@ PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PUB
 PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV4}/32 -j ACCEPT"
 	done <<<"${PUBLIC_IPV4_LIST}"
 
+	# On-link public IPv6 addresses need the server to answer neighbour
+	# solicitations for them (proxy NDP), the IPv6 counterpart of proxy ARP.
 	while IFS= read -r PUBLIC_IPV6; do
 		[[ -n ${PUBLIC_IPV6} ]] || continue
 		RULES="${RULES}
 PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PUBLIC_IPV6}/128 -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV6}/128 -j ACCEPT
+PostUp = ip -6 neigh replace proxy ${PUBLIC_IPV6} dev ${SERVER_PUB_NIC}
 PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -d ${PUBLIC_IPV6}/128 -j ACCEPT
-PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV6}/128 -j ACCEPT"
+PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -s ${PUBLIC_IPV6}/128 -j ACCEPT
+PostDown = ip -6 neigh del proxy ${PUBLIC_IPV6} dev ${SERVER_PUB_NIC} || true"
 	done <<<"${PUBLIC_IPV6_LIST}"
 
 	echo "${RULES}"
@@ -195,14 +239,16 @@ function buildClientConfig() {
 	local HOOK_BLOCK
 
 	ADDRESS_LINE=$(buildClientAddressLine "${PRIVATE_IPV4}" "${PUBLIC_IPV4}" "${PRIVATE_IPV6}" "${PUBLIC_IPV6}")
-	HOOK_BLOCK=$(buildClientHookBlock "${CLIENT_ADDRESS_MODE}" "${WG_INTERFACE}")
+	HOOK_BLOCK=$(buildClientHookBlock "${WG_INTERFACE}" "${PUBLIC_IPV4}" "${PUBLIC_IPV6}")
 
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${ADDRESS_LINE}
-DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
-${HOOK_BLOCK}
-
+DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}"
+	if [[ -n ${HOOK_BLOCK} ]]; then
+		echo "${HOOK_BLOCK}"
+	fi
+	echo "
 # Uncomment the next line to set a custom MTU
 # This might impact performance, so use it only if you know what you are doing
 # See https://github.com/nitred/nr-wg-mtu-finder to find your optimal MTU
@@ -335,6 +381,16 @@ function writeServerConfig() {
 
 	if [[ -n ${PEER_BLOCKS} ]]; then
 		printf '\n%s\n' "${PEER_BLOCKS}" >>"${WG_CONF_FILE}"
+	fi
+
+	chmod 600 "${WG_CONF_FILE}"
+}
+
+function getHooksFromConfig() {
+	local WG_CONF_FILE=$1
+
+	if [[ -e ${WG_CONF_FILE} ]]; then
+		grep -E '^Post(Up|Down) = ' "${WG_CONF_FILE}"
 	fi
 }
 
@@ -512,7 +568,14 @@ function removePublicIpv4AnnouncementService() {
 }
 
 function applyWireGuardConfig() {
-	if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
+	local HOOKS_BEFORE=$1
+	local HOOKS_AFTER
+
+	HOOKS_AFTER=$(getHooksFromConfig "/etc/wireguard/${SERVER_WG_NIC}.conf")
+
+	if [[ ${HOOKS_BEFORE} != "${HOOKS_AFTER}" ]]; then
+		# The firewall hooks changed (a routed public address was added or removed).
+		# wg syncconf cannot re-run PostUp/PostDown, so the interface is restarted.
 		systemctl restart "wg-quick@${SERVER_WG_NIC}"
 	else
 		wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
@@ -697,6 +760,56 @@ function initialCheck() {
 	waitForCloudInit
 }
 
+function fetchPublicIpv4() {
+	local URL
+	local ADDRESS
+
+	for URL in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+		if command -v curl &>/dev/null; then
+			ADDRESS=$(curl -4 -fsS --max-time 5 "${URL}" 2>/dev/null)
+		elif command -v wget &>/dev/null; then
+			ADDRESS=$(wget -4 -qO- --timeout=5 "${URL}" 2>/dev/null)
+		else
+			return 1
+		fi
+		ADDRESS=$(echo "${ADDRESS}" | tr -d '[:space:]')
+		if isValidIpv4 "${ADDRESS}"; then
+			echo "${ADDRESS}"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+function detectPublicIp() {
+	local ADDRESS
+	local EXTERNAL_ADDRESS
+
+	ADDRESS=$(ip -4 -o addr show scope global 2>/dev/null | awk '{ print $4 }' | cut -d '/' -f 1 | head -1)
+	if [[ -n ${ADDRESS} ]] && isPrivateIpv4 "${ADDRESS}"; then
+		# Cloud instances behind 1:1 NAT (AWS, GCP, Azure, Oracle Cloud...) only
+		# carry a private address: ask the outside world which one it sees.
+		EXTERNAL_ADDRESS=$(fetchPublicIpv4) && ADDRESS=${EXTERNAL_ADDRESS}
+	fi
+	if [[ -z ${ADDRESS} ]]; then
+		ADDRESS=$(ip -6 -o addr show scope global 2>/dev/null | awk '{ print $4 }' | cut -d '/' -f 1 | head -1)
+	fi
+
+	echo "${ADDRESS}"
+}
+
+function detectPublicNic() {
+	local NIC
+
+	NIC=$(ip -4 -o route show default 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1) }' | head -1)
+	if [[ -z ${NIC} ]]; then
+		NIC=$(ip -6 -o route show default 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1) }' | head -1)
+	fi
+
+	echo "${NIC}"
+}
+
 function installQuestions() {
 	echo "Welcome to the WireGuard installer!"
 	echo "The git repository is available at: https://github.com/tbringuier/wireguard-install"
@@ -706,15 +819,13 @@ function installQuestions() {
 	echo ""
 
 	# Detect public IPv4 or IPv6 address and pre-fill for the user
-	SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
-	if [[ -z ${SERVER_PUB_IP} ]]; then
-		# Detect public IPv6 address
-		SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
-	fi
-	read -rp "IPv4 or IPv6 public address: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
+	SERVER_PUB_IP=$(detectPublicIp)
+	until [[ -n ${SERVER_PUB_IP} ]] && (isValidIpv4 "${SERVER_PUB_IP}" || isValidIpv6 "${SERVER_PUB_IP//[\[\]]/}"); do
+		read -rp "IPv4 or IPv6 public address: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
+	done
 
 	# Detect public interface and pre-fill for the user
-	SERVER_NIC="$(ip -4 route ls | grep default | awk '/dev/ {for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}' | head -1)"
+	SERVER_NIC=$(detectPublicNic)
 	until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_]+$ ]]; do
 		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
 	done
@@ -723,7 +834,7 @@ function installQuestions() {
 		read -rp "WireGuard interface name: " -e -i wg0 SERVER_WG_NIC
 	done
 
-	until [[ ${SERVER_WG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
+	until isValidIpv4 "${SERVER_WG_IPV4}"; do
 		read -rp "Server WireGuard IPv4: " -e -i 10.66.66.1 SERVER_WG_IPV4
 	done
 
@@ -873,7 +984,7 @@ FIREWALL_BACKEND=${FIREWALL_BACKEND}" >/etc/wireguard/params
 	writeServerConfig "/etc/wireguard/${SERVER_WG_NIC}.conf" "" "" ""
 
 	# Enable routing on the server
-	printf '%s\n' "$(buildSysctlConfig "${PUBLIC_ROUTING_MODE}")" >/etc/sysctl.d/wg.conf
+	printf '%s\n' "$(buildSysctlConfig "${PUBLIC_ROUTING_MODE}" "${SERVER_PUB_NIC}")" >/etc/sysctl.d/wg.conf
 	sysctl --system >/dev/null
 
 	systemctl enable --now "wg-quick@${SERVER_WG_NIC}"
@@ -899,7 +1010,48 @@ FIREWALL_BACKEND=${FIREWALL_BACKEND}" >/etc/wireguard/params
 	fi
 }
 
+function readClientAddress() {
+	# readClientAddress <variable> <prompt> <default> <ipv4|ipv6>
+	# Asks for an address until it is empty (unused), valid and not taken yet.
+	local VARIABLE=$1
+	local PROMPT=$2
+	local DEFAULT=$3
+	local FAMILY=$4
+	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local VALUE
+	local PREFIX_LENGTH=32
+
+	if [[ ${FAMILY} == ipv6 ]]; then
+		PREFIX_LENGTH=128
+	fi
+
+	while :; do
+		read -rp "${PROMPT} (leave empty if unused): " -e -i "${DEFAULT}" VALUE
+		if [[ -z ${VALUE} ]]; then
+			break
+		fi
+
+		if [[ ${FAMILY} == ipv4 ]] && ! isValidIpv4 "${VALUE}"; then
+			echo -e "${ORANGE}${VALUE} is not a valid IPv4 address.${NC}"
+		elif [[ ${FAMILY} == ipv6 ]] && ! isValidIpv6 "${VALUE}"; then
+			echo -e "${ORANGE}${VALUE} is not a valid IPv6 address.${NC}"
+		elif [[ ${VALUE} == "${SERVER_WG_IPV4}" || ${VALUE} == "${SERVER_WG_IPV6}" || ${VALUE} == "${SERVER_PUB_IP//[\[\]]/}" ]]; then
+			echo -e "${ORANGE}${VALUE} is used by the server itself, please choose another address.${NC}"
+		elif grep -q -F "${VALUE}/${PREFIX_LENGTH}" "${WG_CONF_FILE}"; then
+			echo -e "${ORANGE}A client with the address ${VALUE} was already created, please choose another one.${NC}"
+		else
+			break
+		fi
+		echo ""
+	done
+
+	printf -v "${VARIABLE}" '%s' "${VALUE}"
+}
+
 function newClient() {
+	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local HOOKS_BEFORE
+
 	# If SERVER_PUB_IP is IPv6, add brackets if missing
 	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
 		if [[ ${SERVER_PUB_IP} != *"["* ]] || [[ ${SERVER_PUB_IP} != *"]"* ]]; then
@@ -915,7 +1067,7 @@ function newClient() {
 
 	until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
 		read -rp "Client name: " -e CLIENT_NAME
-		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "${WG_CONF_FILE}")
 
 		if [[ ${CLIENT_EXISTS} != 0 ]]; then
 			echo ""
@@ -925,6 +1077,10 @@ function newClient() {
 	done
 
 	if [[ ${PUBLIC_ROUTING_MODE} == 'yes' ]]; then
+		echo ""
+		echo "A private client gets an address from the tunnel subnet and is NATed behind the server."
+		echo "A public client gets one of the server's additional public addresses, routed without NAT."
+		echo "A mixed client gets both."
 		until [[ ${CLIENT_ADDRESS_MODE} =~ ^(private|public|mixed)$ ]]; do
 			read -rp "Client address mode [private/public/mixed]: " -e -i private CLIENT_ADDRESS_MODE
 		done
@@ -932,88 +1088,38 @@ function newClient() {
 		CLIENT_ADDRESS_MODE=private
 	fi
 
+	CLIENT_PRIVATE_IPV4=""
+	CLIENT_PRIVATE_IPV6=""
+	CLIENT_PUBLIC_IPV4=""
+	CLIENT_PUBLIC_IPV6=""
+
 	if [[ ${CLIENT_ADDRESS_MODE} != 'public' ]]; then
+		BASE_IPV4=$(echo "${SERVER_WG_IPV4}" | awk -F '.' '{ print $1"."$2"."$3 }')
+		BASE_IPV6=$(echo "${SERVER_WG_IPV6}" | awk -F '::' '{ print $1 }')
+
+		# Pick the first free host address of the tunnel subnet
 		for DOT_IP in {2..254}; do
-			DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+			DOT_EXISTS=$(grep -c -F "${BASE_IPV4}.${DOT_IP}/32" "${WG_CONF_FILE}")
 			if [[ ${DOT_EXISTS} == '0' ]]; then
 				break
 			fi
 		done
 
-		if [[ ${DOT_EXISTS} == '1' ]]; then
+		if [[ ${DOT_EXISTS} != '0' ]]; then
 			echo ""
 			echo "The subnet configured supports only 253 clients."
 			exit 1
 		fi
 
-		BASE_IPV4=$(echo "${SERVER_WG_IPV4}" | awk -F '.' '{ print $1"."$2"."$3 }')
-		BASE_IPV6=$(echo "${SERVER_WG_IPV6}" | awk -F '::' '{ print $1 }')
-		DEFAULT_PRIVATE_IPV4="${BASE_IPV4}.${DOT_IP}"
-		DEFAULT_PRIVATE_IPV6="${BASE_IPV6}::${DOT_IP}"
-
-		while :; do
-			read -rp "Private client IPv4 (leave empty if unused): " -e -i "${DEFAULT_PRIVATE_IPV4}" CLIENT_PRIVATE_IPV4
-			if [[ -z ${CLIENT_PRIVATE_IPV4} ]]; then
-				break
-			fi
-			IPV4_EXISTS=$(grep -c -F "${CLIENT_PRIVATE_IPV4}/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-			if [[ ${IPV4_EXISTS} == '0' ]]; then
-				break
-			fi
-			echo ""
-			echo -e "${ORANGE}A client with the specified private IPv4 was already created, please choose another IPv4.${NC}"
-			echo ""
-		done
-
-		while :; do
-			read -rp "Private client IPv6 (leave empty if unused): " -e -i "${DEFAULT_PRIVATE_IPV6}" CLIENT_PRIVATE_IPV6
-			if [[ -z ${CLIENT_PRIVATE_IPV6} ]]; then
-				break
-			fi
-			IPV6_EXISTS=$(grep -c -F "${CLIENT_PRIVATE_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-			if [[ ${IPV6_EXISTS} == '0' ]]; then
-				break
-			fi
-			echo ""
-			echo -e "${ORANGE}A client with the specified private IPv6 was already created, please choose another IPv6.${NC}"
-			echo ""
-		done
-	else
-		CLIENT_PRIVATE_IPV4=""
-		CLIENT_PRIVATE_IPV6=""
+		readClientAddress CLIENT_PRIVATE_IPV4 "Private client IPv4" "${BASE_IPV4}.${DOT_IP}" ipv4
+		readClientAddress CLIENT_PRIVATE_IPV6 "Private client IPv6" "${BASE_IPV6}::${DOT_IP}" ipv6
 	fi
 
 	if [[ ${CLIENT_ADDRESS_MODE} != 'private' ]]; then
-		while :; do
-			read -rp "Public client IPv4 (leave empty if unused): " -e CLIENT_PUBLIC_IPV4
-			if [[ -z ${CLIENT_PUBLIC_IPV4} ]]; then
-				break
-			fi
-			PUBLIC_IPV4_EXISTS=$(grep -c -F "${CLIENT_PUBLIC_IPV4}/32" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-			if [[ ${PUBLIC_IPV4_EXISTS} == '0' ]]; then
-				break
-			fi
-			echo ""
-			echo -e "${ORANGE}A client with the specified public IPv4 was already created, please choose another IPv4.${NC}"
-			echo ""
-		done
-
-		while :; do
-			read -rp "Public client IPv6 (leave empty if unused): " -e CLIENT_PUBLIC_IPV6
-			if [[ -z ${CLIENT_PUBLIC_IPV6} ]]; then
-				break
-			fi
-			PUBLIC_IPV6_EXISTS=$(grep -c -F "${CLIENT_PUBLIC_IPV6}/128" "/etc/wireguard/${SERVER_WG_NIC}.conf")
-			if [[ ${PUBLIC_IPV6_EXISTS} == '0' ]]; then
-				break
-			fi
-			echo ""
-			echo -e "${ORANGE}A client with the specified public IPv6 was already created, please choose another IPv6.${NC}"
-			echo ""
-		done
-	else
-		CLIENT_PUBLIC_IPV4=""
-		CLIENT_PUBLIC_IPV6=""
+		echo ""
+		echo "Public addresses must be routed to this server by your provider (additional/failover IP)."
+		readClientAddress CLIENT_PUBLIC_IPV4 "Public client IPv4" "" ipv4
+		readClientAddress CLIENT_PUBLIC_IPV6 "Public client IPv6" "" ipv6
 	fi
 
 	if ! validateClientAddressMode \
@@ -1022,7 +1128,8 @@ function newClient() {
 		"${CLIENT_PUBLIC_IPV4}" \
 		"${CLIENT_PRIVATE_IPV6}" \
 		"${CLIENT_PUBLIC_IPV6}"; then
-		echo "The selected client address mode does not match the provided addresses."
+		echo ""
+		echo -e "${RED}The selected client address mode (${CLIENT_ADDRESS_MODE}) does not match the provided addresses.${NC}"
 		exit 1
 	fi
 
@@ -1059,7 +1166,7 @@ function newClient() {
 		"${CLIENT_PUBLIC_IPV4}" \
 		"${CLIENT_PRIVATE_IPV6}" \
 		"${CLIENT_PUBLIC_IPV6}")
-	EXISTING_PEER_BLOCKS=$(getPeerBlocksFromConfig "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	EXISTING_PEER_BLOCKS=$(getPeerBlocksFromConfig "${WG_CONF_FILE}")
 
 	if [[ -n ${EXISTING_PEER_BLOCKS} ]]; then
 		PEER_BLOCKS="${EXISTING_PEER_BLOCKS}
@@ -1069,15 +1176,16 @@ ${NEW_PEER_BLOCK}"
 		PEER_BLOCKS="${NEW_PEER_BLOCK}"
 	fi
 
+	HOOKS_BEFORE=$(getHooksFromConfig "${WG_CONF_FILE}")
 	writeServerConfig \
-		"/etc/wireguard/${SERVER_WG_NIC}.conf" \
+		"${WG_CONF_FILE}" \
 		"${PEER_BLOCKS}" \
-		"$(listPublicIpv4FromConfig "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		"$(listPublicIpv4FromConfig "${WG_CONF_FILE}")
 ${CLIENT_PUBLIC_IPV4}" \
-		"$(listPublicIpv6FromConfig "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		"$(listPublicIpv6FromConfig "${WG_CONF_FILE}")
 ${CLIENT_PUBLIC_IPV6}"
 	refreshPublicIpv4AnnouncementService
-	applyWireGuardConfig
+	applyWireGuardConfig "${HOOKS_BEFORE}"
 
 	# Generate QR code if qrencode is installed
 	if command -v qrencode &>/dev/null; then
@@ -1101,7 +1209,10 @@ function listClients() {
 }
 
 function revokeClient() {
-	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local HOOKS_BEFORE
+
+	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${WG_CONF_FILE}")
 	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 		echo ""
 		echo "You have no existing clients!"
@@ -1110,7 +1221,7 @@ function revokeClient() {
 
 	echo ""
 	echo "Select the existing client you want to revoke"
-	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+	grep -E "^### Client" "${WG_CONF_FILE}" | cut -d ' ' -f 3 | nl -s ') '
 	until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
 		if [[ ${CLIENT_NUMBER} == '1' ]]; then
 			read -rp "Select one client [1]: " CLIENT_NUMBER
@@ -1120,24 +1231,25 @@ function revokeClient() {
 	done
 
 	# match the selected number to a client name
-	CLIENT_NAME=$(grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
+	CLIENT_NAME=$(grep -E "^### Client" "${WG_CONF_FILE}" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
 
 	# remove [Peer] block matching $CLIENT_NAME
-	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+	HOOKS_BEFORE=$(getHooksFromConfig "${WG_CONF_FILE}")
+	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "${WG_CONF_FILE}"
 
 	# remove generated client file
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	rm -f "${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
 
-	# restart wireguard to apply changes
-	PEER_BLOCKS=$(getPeerBlocksFromConfig "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	# regenerate the server configuration without this peer and apply it
+	PEER_BLOCKS=$(getPeerBlocksFromConfig "${WG_CONF_FILE}")
 	writeServerConfig \
-		"/etc/wireguard/${SERVER_WG_NIC}.conf" \
+		"${WG_CONF_FILE}" \
 		"${PEER_BLOCKS}" \
-		"$(listPublicIpv4FromConfig "/etc/wireguard/${SERVER_WG_NIC}.conf")" \
-		"$(listPublicIpv6FromConfig "/etc/wireguard/${SERVER_WG_NIC}.conf")"
+		"$(listPublicIpv4FromConfig "${WG_CONF_FILE}")" \
+		"$(listPublicIpv6FromConfig "${WG_CONF_FILE}")"
 	refreshPublicIpv4AnnouncementService
-	applyWireGuardConfig
+	applyWireGuardConfig "${HOOKS_BEFORE}"
 }
 
 function uninstallWg() {
