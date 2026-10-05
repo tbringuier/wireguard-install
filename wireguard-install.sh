@@ -219,18 +219,29 @@ function buildServerPeerBlock() {
 	local PUBLIC_IPV4=$6
 	local PRIVATE_IPV6=$7
 	local PUBLIC_IPV6=$8
+	local ENDPOINT=$9
 
-	# Keepalives are only useful on the NATed side, so the client config carries them
 	echo "### Client ${CLIENT_NAME}
 # AddressMode: ${CLIENT_ADDRESS_MODE}
 # PrivateIPv4: ${PRIVATE_IPV4}
 # PublicIPv4: ${PUBLIC_IPV4}
 # PrivateIPv6: ${PRIVATE_IPV6}
 # PublicIPv6: ${PUBLIC_IPV6}
+# Endpoint: ${ENDPOINT}
 [Peer]
 PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
-AllowedIPs = $(buildPeerAllowedIps "${PRIVATE_IPV4}" "${PUBLIC_IPV4}" "${PRIVATE_IPV6}" "${PUBLIC_IPV6}")"
+AllowedIPs = $(buildPeerAllowedIps "${PRIVATE_IPV4}" "${PUBLIC_IPV4}" "${PRIVATE_IPV6}" "${PUBLIC_IPV6}")
+PersistentKeepalive = 15"
+}
+
+function formatEndpoint() {
+	# formatEndpoint <host> <port>: IPv6 literals need brackets
+	if isValidIpv6 "$1"; then
+		echo "[$1]:$2"
+	else
+		echo "$1:$2"
+	fi
 }
 
 function listPublicAddresses() {
@@ -695,7 +706,7 @@ function fetchPublicIpv4() {
 	return 1
 }
 
-function detectPublicIp() {
+function detectPublicIpv4() {
 	local ADDRESS
 	local EXTERNAL_ADDRESS
 
@@ -704,11 +715,32 @@ function detectPublicIp() {
 		# Cloud instances behind 1:1 NAT only carry a private address
 		EXTERNAL_ADDRESS=$(fetchPublicIpv4) && ADDRESS=${EXTERNAL_ADDRESS}
 	fi
-	if [[ -z ${ADDRESS} ]]; then
-		ADDRESS=$(ip -6 -o addr show scope global 2>/dev/null | awk '{ print $4 }' | cut -d '/' -f 1 | head -1)
-	fi
 
 	echo "${ADDRESS}"
+}
+
+function detectPublicIpv6() {
+	# First global address that is not a ULA (fc00::/7)
+	ip -6 -o addr show scope global 2>/dev/null | awk '{ print $4 }' | cut -d '/' -f 1 | grep -v -i -E '^f[cd]' | head -1
+}
+
+function readOptionalValue() {
+	# readOptionalValue <variable> <prompt> <default> <validator>: empty is accepted
+	local VARIABLE=$1
+	local PROMPT=$2
+	local DEFAULT=$3
+	local VALIDATOR=$4
+	local VALUE
+
+	while :; do
+		read -rp "${PROMPT}: " -e -i "${DEFAULT}" VALUE
+		if [[ -z ${VALUE} ]] || "${VALIDATOR}" "${VALUE}"; then
+			break
+		fi
+		echo -e "${ORANGE}${VALUE} is not valid.${NC}"
+	done
+
+	printf -v "${VARIABLE}" '%s' "${VALUE}"
 }
 
 function detectPublicNic() {
@@ -802,10 +834,15 @@ function installQuestions() {
 	echo "You can keep the default options and just press enter if you are ok with them."
 	echo ""
 
-	# Detect public IPv4 or IPv6 address and pre-fill for the user
-	SERVER_PUB_IP=$(detectPublicIp)
-	until isValidIpv4 "${SERVER_PUB_IP}" || isValidIpv6 "${SERVER_PUB_IP//[\[\]]/}" || isValidHostname "${SERVER_PUB_IP}"; do
-		read -rp "Public IPv4, IPv6 or hostname of this server: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
+	# Clients can use any of the server's public addresses as endpoint, so ask for all of them
+	echo "Public addresses of this server (leave empty the ones it does not have):"
+	until [[ -n ${SERVER_PUB_IPV4}${SERVER_PUB_IPV6}${SERVER_HOSTNAME} ]]; do
+		readOptionalValue SERVER_PUB_IPV4 "Public IPv4" "$(detectPublicIpv4)" isValidIpv4
+		readOptionalValue SERVER_PUB_IPV6 "Public IPv6" "$(detectPublicIpv6)" isValidIpv6
+		readOptionalValue SERVER_HOSTNAME "Hostname pointing to this server" "" isValidHostname
+		if [[ -z ${SERVER_PUB_IPV4}${SERVER_PUB_IPV6}${SERVER_HOSTNAME} ]]; then
+			echo -e "${ORANGE}At least one public address or hostname is needed.${NC}"
+		fi
 	done
 
 	# Detect public interface and pre-fill for the user
@@ -968,7 +1005,9 @@ function installWireGuard() {
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
 
 	# Save WireGuard settings
-	echo "SERVER_PUB_IP=${SERVER_PUB_IP}
+	echo "SERVER_PUB_IPV4=${SERVER_PUB_IPV4}
+SERVER_PUB_IPV6=${SERVER_PUB_IPV6}
+SERVER_HOSTNAME=${SERVER_HOSTNAME}
 SERVER_PUB_NIC=${SERVER_PUB_NIC}
 SERVER_WG_NIC=${SERVER_WG_NIC}
 SERVER_WG_IPV4=${SERVER_WG_IPV4}
@@ -1017,6 +1056,47 @@ FIREWALL_INTEGRATION=${FIREWALL_INTEGRATION}" >/etc/wireguard/params
 	warnAboutOtherFirewalls
 }
 
+function chooseEndpoint() {
+	# Sets ENDPOINT to one of the server addresses saved at install time, or a custom host
+	local OPTIONS=()
+	local HOSTS=()
+	local CHOICE=""
+	local CUSTOM=""
+	local INDEX
+
+	if [[ -n ${SERVER_PUB_IPV6} ]]; then
+		OPTIONS+=("IPv6 $(formatEndpoint "${SERVER_PUB_IPV6}" "${SERVER_PORT}") (recommended: IPv4 addresses attract most attacks)")
+		HOSTS+=("${SERVER_PUB_IPV6}")
+	fi
+	if [[ -n ${SERVER_PUB_IPV4} ]]; then
+		OPTIONS+=("IPv4 ${SERVER_PUB_IPV4}:${SERVER_PORT}")
+		HOSTS+=("${SERVER_PUB_IPV4}")
+	fi
+	if [[ -n ${SERVER_HOSTNAME} ]]; then
+		OPTIONS+=("Hostname ${SERVER_HOSTNAME}:${SERVER_PORT}")
+		HOSTS+=("${SERVER_HOSTNAME}")
+	fi
+	OPTIONS+=("Another hostname or address")
+
+	echo ""
+	echo "Endpoint this client connects to (it must be able to reach it):"
+	for INDEX in "${!OPTIONS[@]}"; do
+		echo "   $((INDEX + 1))) ${OPTIONS[INDEX]}"
+	done
+	until [[ ${CHOICE} =~ ^[0-9]+$ && ${CHOICE} -ge 1 && ${CHOICE} -le ${#OPTIONS[@]} ]]; do
+		read -rp "Select an option [1-${#OPTIONS[@]}]: " -e -i 1 CHOICE
+	done
+
+	if [[ ${CHOICE} -le ${#HOSTS[@]} ]]; then
+		ENDPOINT=$(formatEndpoint "${HOSTS[CHOICE - 1]}" "${SERVER_PORT}")
+	else
+		until isValidIpv4 "${CUSTOM}" || isValidIpv6 "${CUSTOM}" || isValidHostname "${CUSTOM}"; do
+			read -rp "Hostname or IP address: " -e CUSTOM
+		done
+		ENDPOINT=$(formatEndpoint "${CUSTOM}" "${SERVER_PORT}")
+	fi
+}
+
 function readClientAddress() {
 	# readClientAddress <variable> <prompt> <default> <ipv4|ipv6> <private|public>
 	# Asks for an address until it is empty (unused), valid and not taken yet.
@@ -1043,7 +1123,7 @@ function readClientAddress() {
 			echo -e "${ORANGE}${VALUE} is not a valid IPv4 address.${NC}"
 		elif [[ ${FAMILY} == ipv6 ]] && ! isValidIpv6 "${VALUE}"; then
 			echo -e "${ORANGE}${VALUE} is not a valid IPv6 address.${NC}"
-		elif [[ ${VALUE} == "${SERVER_WG_IPV4}" || ${VALUE} == "${SERVER_WG_IPV6}" || ${VALUE} == "${SERVER_PUB_IP//[\[\]]/}" ]]; then
+		elif [[ ${VALUE} == "${SERVER_WG_IPV4}" || ${VALUE} == "${SERVER_WG_IPV6}" || ${VALUE} == "${SERVER_PUB_IPV4}" || ${VALUE} == "${SERVER_PUB_IPV6}" ]]; then
 			echo -e "${ORANGE}${VALUE} is used by the server itself, please choose another address.${NC}"
 		elif [[ ${SCOPE} == public ]] && [[ -n $(ip -o addr show to "${VALUE}" 2>/dev/null) ]]; then
 			echo -e "${ORANGE}${VALUE} is configured on a network interface of this server, so it cannot be routed to a client.${NC}"
@@ -1061,14 +1141,6 @@ function readClientAddress() {
 
 function newClient() {
 	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
-
-	# If SERVER_PUB_IP is IPv6, add brackets if missing
-	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
-		if [[ ${SERVER_PUB_IP} != *"["* ]] || [[ ${SERVER_PUB_IP} != *"]"* ]]; then
-			SERVER_PUB_IP="[${SERVER_PUB_IP}]"
-		fi
-	fi
-	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
 
 	echo ""
 	echo "Client configuration"
@@ -1143,6 +1215,8 @@ function newClient() {
 		exit 1
 	fi
 
+	chooseEndpoint
+
 	# Generate key pair for the client
 	CLIENT_PRIV_KEY=$(wg genkey)
 	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | wg pubkey)
@@ -1177,7 +1251,8 @@ function newClient() {
 		"${CLIENT_PRIVATE_IPV4}" \
 		"${CLIENT_PUBLIC_IPV4}" \
 		"${CLIENT_PRIVATE_IPV6}" \
-		"${CLIENT_PUBLIC_IPV6}")
+		"${CLIENT_PUBLIC_IPV6}" \
+		"${ENDPOINT}")
 	EXISTING_PEER_BLOCKS=$(getPeerBlocksFromConfig "${WG_CONF_FILE}")
 
 	if [[ -n ${EXISTING_PEER_BLOCKS} ]]; then
@@ -1314,6 +1389,19 @@ function loadParams() {
 	# Installations made by earlier versions lack these keys
 	SERVER_WG_MTU=${SERVER_WG_MTU:-1420}
 	FIREWALL_INTEGRATION=${FIREWALL_INTEGRATION:-none}
+	SERVER_PUB_IPV4=${SERVER_PUB_IPV4:-}
+	SERVER_PUB_IPV6=${SERVER_PUB_IPV6:-}
+	SERVER_HOSTNAME=${SERVER_HOSTNAME:-}
+	if [[ -n ${SERVER_PUB_IP:-} && -z ${SERVER_PUB_IPV4}${SERVER_PUB_IPV6}${SERVER_HOSTNAME} ]]; then
+		local LEGACY_ENDPOINT=${SERVER_PUB_IP//[\[\]]/}
+		if isValidIpv4 "${LEGACY_ENDPOINT}"; then
+			SERVER_PUB_IPV4=${LEGACY_ENDPOINT}
+		elif isValidIpv6 "${LEGACY_ENDPOINT}"; then
+			SERVER_PUB_IPV6=${LEGACY_ENDPOINT}
+		else
+			SERVER_HOSTNAME=${LEGACY_ENDPOINT}
+		fi
+	fi
 }
 
 function manageMenu() {

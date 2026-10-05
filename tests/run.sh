@@ -102,9 +102,9 @@ assertContains "public client address" "Address = 203.0.113.5/32" "${CLIENT}"
 assertContains "bracketed IPv6 endpoint" "Endpoint = [2001:db8::1]:51820" "${CLIENT}"
 
 # --- server peer blocks and extraction ---
-PEER_A=$(buildServerPeerBlock alice public KEYA PSKA "" 203.0.113.5 "" 2001:db8::5)
-PEER_B=$(buildServerPeerBlock bob private KEYB PSKB 10.66.66.2 "" fd42:42:42::2 "")
-PEER_C=$(buildServerPeerBlock carol mixed KEYC PSKC 10.66.66.3 203.0.113.6 "" "")
+PEER_A=$(buildServerPeerBlock alice public KEYA PSKA "" 203.0.113.5 "" 2001:db8::5 "[2001:db8::1]:51820")
+PEER_B=$(buildServerPeerBlock bob private KEYB PSKB 10.66.66.2 "" fd42:42:42::2 "" 198.51.100.1:51820)
+PEER_C=$(buildServerPeerBlock carol mixed KEYC PSKC 10.66.66.3 203.0.113.6 "" "" vpn.example.com:51820)
 PEERS="${PEER_A}
 
 ${PEER_B}
@@ -112,7 +112,11 @@ ${PEER_B}
 ${PEER_C}"
 assertContains "peer header" "### Client alice" "${PEER_A}"
 assertContains "peer AllowedIPs" "AllowedIPs = 203.0.113.5/32,2001:db8::5/128" "${PEER_A}"
-assertNotContains "no keepalive on the server side" "PersistentKeepalive" "${PEER_A}"
+assertContains "server side keepalive" "PersistentKeepalive = 15" "${PEER_A}"
+assertContains "endpoint recorded" "# Endpoint: [2001:db8::1]:51820" "${PEER_A}"
+assertEquals "IPv6 endpoints get brackets" "[2001:db8::1]:51820" "$(formatEndpoint 2001:db8::1 51820)"
+assertEquals "IPv4 endpoint" "198.51.100.1:51820" "$(formatEndpoint 198.51.100.1 51820)"
+assertEquals "hostname endpoint" "vpn.example.com:51820" "$(formatEndpoint vpn.example.com 51820)"
 assertEquals "public v4 list" $'203.0.113.5\n203.0.113.6' "$(listPublicAddresses PublicIPv4 "${PEERS}")"
 assertEquals "public v6 list" "2001:db8::5" "$(listPublicAddresses PublicIPv6 "${PEERS}")"
 assertEquals "removing a peer by name" 2 "$(echo "${PEERS}" | sed "/^### Client alice\$/,/^$/d" | grep -c '^### Client')"
