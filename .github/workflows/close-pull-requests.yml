@@ -1,0 +1,22 @@
+# This fork does not accept contributions: close every pull request with a pointer to upstream.
+# pull_request_target runs with repository permissions, so nothing from the PR is checked out or executed.
+name: Close pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          gh pr comment "${PR}" --body "Thanks for your interest, but this personal fork does not accept contributions (see CONTRIBUTING.md). Generic improvements belong upstream: https://github.com/angristan/wireguard-install"
+          gh pr close "${PR}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
