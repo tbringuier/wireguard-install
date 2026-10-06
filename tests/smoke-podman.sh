@@ -80,9 +80,6 @@ podman cp wireguard-install.sh "${CONTAINER}:/root/wireguard-install.sh"
 NIC=$(inside sh -c "ip -o -4 route show default | awk '{for (i = 1; i <= NF; i++) if (\$i == \"dev\") print \$(i + 1)}' | head -1")
 echo "Public interface inside the container: ${NIC}"
 
-# A unit from the previous generation of this fork must be migrated away
-inside sh -c 'printf "[Service]\nExecStart=/bin/true\n" >/etc/systemd/system/wg-public-ipv4-arping.service'
-
 case "${FIREWALL}" in
 ufw)
 	echo "== enabling ufw"
@@ -115,7 +112,6 @@ check "announcement unit is active" systemctl is-active --quiet wg-public-ipv4-a
 check "announcement unit is enabled" systemctl is-enabled --quiet wg-public-ipv4-announce@wg0
 check "announcement unit logs its addresses" sh -c 'journalctl -u wg-public-ipv4-announce@wg0 --no-pager | grep -q "Announcing 203.0.113.50 on"'
 check "announcement unit has no failures" sh -c '! journalctl -u wg-public-ipv4-announce@wg0 --no-pager | grep -q -E "Cannot announce|Traceback"'
-check "legacy unit removed" sh -c '! test -e /etc/systemd/system/wg-public-ipv4-arping.service'
 check "nft table loaded" nft list table inet wireguard
 check "mss clamp on the server" sh -c 'nft list table inet wireguard | grep -q "maxseg size set 1380"'
 check "private subnet is NATed" sh -c 'nft list table inet wireguard | grep -q "ip saddr 10.66.66.0/24 masquerade"'

@@ -420,16 +420,6 @@ ProtectControlGroups=true
 WantedBy=wg-quick@%i.service"
 }
 
-function removeLegacyPublicIpv4AnnouncementService() {
-	# Versions of this fork before October 2026 installed a non-template unit
-	if [[ -e /etc/systemd/system/wg-public-ipv4-arping.service ]]; then
-		systemctl disable --now wg-public-ipv4-arping.service >/dev/null 2>&1 || true
-		rm -f /etc/systemd/system/wg-public-ipv4-arping.service
-		rm -f /etc/wireguard/wg-public-ipv4-arping.sh /etc/wireguard/public-ipv4.list
-		systemctl daemon-reload
-	fi
-}
-
 function refreshPublicIpv4AnnouncementService() {
 	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
 	local UNIT="wg-public-ipv4-announce@${SERVER_WG_NIC}.service"
@@ -440,8 +430,6 @@ function refreshPublicIpv4AnnouncementService() {
 	if [[ ${PUBLIC_ROUTING_MODE} != 'yes' ]]; then
 		return
 	fi
-
-	removeLegacyPublicIpv4AnnouncementService
 
 	PUBLIC_IPV4_LIST=$(listPublicAddresses PublicIPv4 "$(getPeerBlocksFromConfig "${WG_CONF_FILE}")" | paste -sd ' ')
 
@@ -473,8 +461,6 @@ function refreshPublicIpv4AnnouncementService() {
 }
 
 function removePublicIpv4AnnouncementService() {
-	removeLegacyPublicIpv4AnnouncementService
-
 	systemctl disable --now "wg-public-ipv4-announce@${SERVER_WG_NIC}.service" >/dev/null 2>&1 || true
 	rm -f /etc/systemd/system/wg-public-ipv4-announce@.service
 	rm -f /etc/wireguard/wg-public-ipv4-announce.py "/etc/wireguard/public-ipv4-announce-${SERVER_WG_NIC}.env"
@@ -484,36 +470,24 @@ function removePublicIpv4AnnouncementService() {
 function applyServerConfig() {
 	# applyServerConfig <peer blocks>
 	# Regenerates the server configuration and applies it live: peers through
-	# wg syncconf, proxy ARP/NDP entries through ip neigh. Only a change in the
-	# other hooks (a migration, an edited parameter) stops and starts the tunnel,
-	# since wg-quick runs PostDown from the file on disk.
+	# wg syncconf, the nftables table through nft, proxy entries through ip neigh.
 	local PEER_BLOCKS=$1
 	local WG_CONF_FILE="/etc/wireguard/${SERVER_WG_NIC}.conf"
 	local NEW_CONF_FILE="${WG_CONF_FILE}.new"
 	local UNIT="wg-quick@${SERVER_WG_NIC}.service"
-	local TUNNEL_ACTIVE=no
 	local PROXIES_BEFORE
 	local PROXIES_AFTER
 	local ENTRY
 
 	writeServerConfig "${NEW_CONF_FILE}" "${PEER_BLOCKS}"
-
-	if systemctl is-active --quiet "${UNIT}"; then
-		TUNNEL_ACTIVE=yes
-	fi
-
-	if [[ ${TUNNEL_ACTIVE} == yes && $(getHooksFromConfig "${WG_CONF_FILE}" | grep -v ' neigh ') != "$(getHooksFromConfig "${NEW_CONF_FILE}" | grep -v ' neigh ')" ]]; then
-		systemctl stop "${UNIT}"
-		TUNNEL_ACTIVE=no
-	fi
-
 	PROXIES_BEFORE=$(listProxyEntries "${WG_CONF_FILE}" | sort)
 	PROXIES_AFTER=$(listProxyEntries "${NEW_CONF_FILE}" | sort)
 	cp -p "${WG_CONF_FILE}" "${WG_CONF_FILE}.bak"
 	mv "${NEW_CONF_FILE}" "${WG_CONF_FILE}"
 
-	if [[ ${TUNNEL_ACTIVE} == yes ]]; then
+	if systemctl is-active --quiet "${UNIT}"; then
 		wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+		nft -f "/etc/wireguard/${SERVER_WG_NIC}.nft"
 		while read -r ENTRY; do
 			# shellcheck disable=SC2086
 			[[ -n ${ENTRY} ]] && ip ${ENTRY%% *} neigh del proxy ${ENTRY#* } 2>/dev/null
@@ -982,10 +956,6 @@ function installWireGuard() {
 		local APT_GET=(apt-get -o DPkg::Lock::Timeout=300)
 		"${APT_GET[@]}" update
 		installPackages "${APT_GET[@]}" install -y wireguard-tools nftables python3
-		if ! hasWireGuardKernelSupport; then
-			# Kernel older than 5.6: the metapackage pulls the DKMS module
-			installOptionalPackages "${APT_GET[@]}" install -y wireguard
-		fi
 		installOptionalPackages "${APT_GET[@]}" install -y qrencode
 		;;
 	rhel)
@@ -1461,7 +1431,7 @@ function uninstallWg() {
 
 		case "${OS_FAMILY}" in
 		debian)
-			apt-get -o DPkg::Lock::Timeout=300 remove -y wireguard wireguard-tools qrencode
+			apt-get -o DPkg::Lock::Timeout=300 remove -y wireguard-tools qrencode
 			;;
 		rhel)
 			dnf remove -y --noautoremove wireguard-tools qrencode
@@ -1510,28 +1480,6 @@ function uninstallWg() {
 	fi
 }
 
-function loadParams() {
-	source /etc/wireguard/params
-
-	# Installations made by earlier versions lack these keys
-	SERVER_WG_MTU=${SERVER_WG_MTU:-1420}
-	FIREWALL_INTEGRATION=${FIREWALL_INTEGRATION:-none}
-	SERVER_PUB_IPV4=${SERVER_PUB_IPV4:-}
-	SERVER_PUB_IPV6=${SERVER_PUB_IPV6:-}
-	SERVER_HOSTNAME=${SERVER_HOSTNAME:-}
-	SERVER_PUB_IPV6_PREFIX=${SERVER_PUB_IPV6_PREFIX:-}
-	if [[ -n ${SERVER_PUB_IP:-} && -z ${SERVER_PUB_IPV4}${SERVER_PUB_IPV6}${SERVER_HOSTNAME} ]]; then
-		local LEGACY_ENDPOINT=${SERVER_PUB_IP//[\[\]]/}
-		if isValidIpv4 "${LEGACY_ENDPOINT}"; then
-			SERVER_PUB_IPV4=${LEGACY_ENDPOINT}
-		elif isValidIpv6 "${LEGACY_ENDPOINT}"; then
-			SERVER_PUB_IPV6=${LEGACY_ENDPOINT}
-		else
-			SERVER_HOSTNAME=${LEGACY_ENDPOINT}
-		fi
-	fi
-}
-
 function manageMenu() {
 	echo "Welcome to WireGuard-install!"
 	echo "The git repository is available at: https://github.com/tbringuier/wireguard-install"
@@ -1572,7 +1520,7 @@ if [[ "${WG_INSTALL_TESTING:-0}" != 1 ]]; then
 
 	# Check if WireGuard is already installed and load params
 	if [[ -e /etc/wireguard/params ]]; then
-		loadParams
+		source /etc/wireguard/params
 		manageMenu
 	else
 		installWireGuard
