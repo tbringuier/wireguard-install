@@ -22,6 +22,8 @@ French; the repository itself is English-only.
   template units; never cron or hand-rolled daemons.
 - **Interactive only**: the installer asks questions; there is no unattended/AUTO_INSTALL mode
   (decided by the maintainer, do not add one).
+- **Fresh installations only**: no migration code, no compatibility with files written by
+  earlier versions of this script. Uninstall and reinstall instead.
 - **Distribution agnostic**: detect the package family from `ID`/`ID_LIKE`, fall back on the
   available package manager. Do not add per-distribution special cases unless a package really
   differs.
